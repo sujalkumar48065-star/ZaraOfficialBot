@@ -24,6 +24,7 @@ def make_update(
         message_id=20,
         reply_to_message=reply,
         delete=AsyncMock(),
+        reply_text=AsyncMock(),
     )
     chat = SimpleNamespace(
         id=-1001,
@@ -563,3 +564,58 @@ async def test_rob_creates_actor_row_before_crediting(store, monkeypatch):
         "SELECT balance FROM users WHERE user_id=?", (actor_id,)
     ).fetchone()
     assert actor["balance"] > 0
+
+@pytest.mark.asyncio
+async def test_safe_reply_formats_plain_short_text_as_pre():
+    update, _, message = make_update("/anything")
+
+    await zara_bot.safe_reply(update, "reply to someone to slap them")
+
+    assert message.reply_text.await_args.args[0] == "<pre>reply to someone to slap them</pre>"
+
+
+@pytest.mark.asyncio
+async def test_safe_reply_keeps_links_clickable_in_blockquote():
+    update, _, message = make_update("/anything")
+    text = '<a href="tg://user?id=705">sᴛʏʟᴇᴅ ᴜsᴇʀ</a> ɪs ʜᴇʀᴇ'
+
+    await zara_bot.safe_reply(update, text)
+
+    sent = message.reply_text.await_args.args[0]
+    assert sent.startswith("<blockquote>")
+    assert 'href="tg://user?id=705"' in sent
+
+
+@pytest.mark.asyncio
+async def test_safe_reply_does_not_double_wrap_existing_design():
+    update, _, message = make_update("/anything")
+    text = "<blockquote>already designed</blockquote>"
+
+    await zara_bot.safe_reply(update, text)
+
+    assert message.reply_text.await_args.args[0] == text
+
+
+@pytest.mark.asyncio
+async def test_safe_reply_preserves_mixed_start_design(store):
+    user = SimpleNamespace(id=710, username="starter", full_name="Starter", is_bot=False)
+    row = store.user(user)
+    text = zara_bot.start_message(user, row)
+    update, _, message = make_update("/start", user_id=user.id)
+
+    await zara_bot.safe_reply(update, text)
+
+    assert message.reply_text.await_args.args[0] == text
+
+
+@pytest.mark.asyncio
+async def test_ban_success_uses_blockquote_and_clickable_target(store, monkeypatch):
+    reply = patch_admin(monkeypatch)
+    update, context, _ = make_update("/ban 12345", ["12345"])
+
+    await zara_bot.admin_command(update, context)
+
+    sent = reply.await_args.args[1]
+    assert sent.startswith("<blockquote>")
+    assert 'href="tg://user?id=12345"' in sent
+    assert "ʙᴀɴ" in sent

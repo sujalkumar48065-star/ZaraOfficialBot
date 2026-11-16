@@ -642,6 +642,16 @@ def pre_or_quote(value: str, limit: int = PRE_TEXT_MAX) -> str:
     return f"<pre>{safe}</pre>"
 
 
+def auto_format_reply(text: str) -> str:
+    """Format every plain reply; never double-wrap an existing design."""
+    lowered = text.lower()
+    if "<pre>" in lowered or "<blockquote>" in lowered:
+        return text
+    if re.search(r"<(?:a|b|i|u|s|code|tg-spoiler)\b", text, re.IGNORECASE):
+        return f"<blockquote>{text}</blockquote>"
+    return pre_or_quote(text)
+
+
 def message_command(update: Update) -> str:
     message = getattr(update, "effective_message", None)
     text = getattr(message, "text", None) or ""
@@ -1331,11 +1341,7 @@ def ipv4_async_client(**kwargs: Any) -> httpx.AsyncClient:
 
 
 async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
-    if (
-        message_command(update) in FORMAT_REPLY_COMMANDS
-        and not text.lstrip().startswith(("<pre>", "<blockquote>"))
-    ):
-        text = pre_or_quote(text)
+    text = auto_format_reply(text)
     if update.effective_message:
         try:
             return await update.effective_message.reply_text(
@@ -3371,7 +3377,11 @@ async def give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except InsufficientBalanceError:
         await safe_reply(update, "❌ ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ ᴍᴏɴᴇʏ.")
         return
-    await safe_reply(update, f"✅ {mention(update.effective_user)} ɢᴀᴠᴇ <b>${amount:,}</b> ᴛᴏ {esc(target['name'] if target else str(target_id))}.")
+    await safe_reply(
+        update,
+        f"<blockquote>✅ {mention_styled(update.effective_user)} {styled('gave')} "
+        f"<b>${amount:,}</b> {styled('to')} {mention_row_styled(target)}.</blockquote>",
+    )
 
 
 async def protect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3406,7 +3416,11 @@ async def rob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if amount <= 0:
         await safe_reply(update, f"💰 {esc(target['name'])} ʜᴀs ɴᴏ ᴄᴏɪɴs ᴛᴏ ʀᴏʙ.")
         return
-    await safe_reply(update, f"💰 {mention(update.effective_user)} ʀᴏʙʙᴇᴅ <b>${amount:,}</b> ғʀᴏᴍ {esc(target['name'])}.")
+    await safe_reply(
+        update,
+        f"<blockquote>💰 {mention_styled(update.effective_user)} {styled('robbed')} "
+        f"<b>${amount:,}</b> {styled('from')} {mention_row_styled(target)}.</blockquote>",
+    )
 
 
 async def kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3425,7 +3439,11 @@ async def kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_reply(update, f"🛡️ {esc(target['name'])} ɪs ᴘʀᴏᴛᴇᴄᴛᴇᴅ ғᴏʀ {protection_text(target, target_id)}.")
         return
     STORE.kill(target_id, update.effective_user.id)
-    await safe_reply(update, f"⚔️ {mention(update.effective_user)} ᴅᴇғᴇᴀᴛᴇᴅ {esc(target['name'])}. /revive ᴄᴀɴ ʙʀɪɴɢ ᴛʜᴇᴍ ʙᴀᴄᴋ.")
+    await safe_reply(
+        update,
+        f"<blockquote>⚔️ {mention_styled(update.effective_user)} {styled('defeated')} "
+        f"{mention_row_styled(target)}. {styled('/revive can bring them back.')}</blockquote>",
+    )
 
 
 async def revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3444,7 +3462,10 @@ async def revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not STORE.revive(target_id, update.effective_user.id, cost):
         await safe_reply(update, "❌ ʏᴏᴜ ɴᴇᴇᴅ $50 ᴛᴏ ʀᴇᴠɪᴠᴇ.")
         return
-    await safe_reply(update, f"💖 {esc(target['name'])} ɪs ʙᴀᴄᴋ ᴀʟɪᴠᴇ.")
+    await safe_reply(
+        update,
+        f"<blockquote>💖 {mention_row_styled(target)} {styled('is back alive.')}</blockquote>",
+    )
 
 
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4885,7 +4906,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if count < limit:
             await safe_reply(
                 update,
-                f"⚠️ ᴡᴀʀɴᴇᴅ {esc(target_name)}. ᴡᴀʀɴɪɴɢs: <b>{count}/{limit}</b>.",
+                f"<blockquote>⚠️ {styled('warned')} {mention_row_styled(target)}. "
+                f"{styled('warnings:')} <b>{count}/{limit}</b>.</blockquote>",
             )
             return
         action = str(settings.get("warn_action", "mute"))
@@ -5009,8 +5031,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    suffix = f" ғᴏʀ {duration_text(duration)}" if duration else ""
-    await safe_reply(update, f"✅ /{command} ᴅᴏɴᴇ ғᴏʀ {esc(target_name)}{suffix}.")
+    suffix = f" {styled('for')} {duration_text(duration)}" if duration else ""
+    await safe_reply(
+        update,
+        f"<blockquote>✅ {styled('/' + command)} {styled('done for')} "
+        f"{mention_row_styled(target)}{suffix}.</blockquote>",
+    )
 
 
 async def warnings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
