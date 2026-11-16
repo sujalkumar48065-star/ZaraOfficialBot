@@ -444,15 +444,9 @@ def test_short_replies_use_pre_and_long_replies_fall_back_to_blockquote():
     assert zara_bot.pre_or_quote(long_text).startswith("<blockquote>")
 
 
-def test_leaderboard_back_button_does_not_force_main_menu():
+def test_leaderboard_has_no_buttons():
     _, markup = zara_bot.leaderboard_text([], "Top")
-    callbacks = [
-        button.callback_data
-        for row in markup.inline_keyboard
-        for button in row
-    ]
-    assert "cat:economy" in callbacks
-    assert "nav:home" not in callbacks
+    assert markup is None
 
 
 def test_profile_and_start_stats_use_pre_formatting(store):

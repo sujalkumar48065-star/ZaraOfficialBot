@@ -1267,19 +1267,7 @@ def leaderboard_text(
             "✅ ᴜᴘɢʀᴀᴅᴇ ᴛᴏ ᴘʀᴇᴍɪᴜᴍ: /pay",
         ]
     )
-    markup = (
-        InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🌐 Global Top 10", callback_data="global_toprich")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="nav:explore")],
-            ]
-        )
-        if include_global_button
-        else InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Back", callback_data="cat:economy")]]
-        )
-    )
-    return "\n".join(lines), markup
+    return "\n".join(lines), None
 
 
 def number_arg(update: Update, default: int = 0) -> int:
