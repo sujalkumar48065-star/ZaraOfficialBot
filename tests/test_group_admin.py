@@ -444,9 +444,20 @@ def test_short_replies_use_pre_and_long_replies_fall_back_to_blockquote():
     assert zara_bot.pre_or_quote(long_text).startswith("<blockquote>")
 
 
-def test_leaderboard_has_no_buttons():
-    _, markup = zara_bot.leaderboard_text([], "Top")
+def test_leaderboard_is_blockquoted_and_has_no_buttons():
+    text, markup = zara_bot.leaderboard_text([], "Top")
+    assert text.startswith("<blockquote>")
     assert markup is None
+
+
+def test_styled_mentions_keep_links_and_small_caps(store):
+    user = SimpleNamespace(id=705, username="styled", full_name="Styled User", is_bot=False)
+    row = store.user(user)
+
+    text = zara_bot.mention_row_styled(row)
+
+    assert 'href="tg://user?id=705"' in text
+    assert zara_bot.styled("Styled User") in text
 
 
 def test_profile_and_start_stats_use_pre_formatting(store):

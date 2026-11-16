@@ -598,6 +598,34 @@ MODERATION_REPLY_COMMANDS = frozenset(
         "admins",
     }
 )
+FORMAT_REPLY_COMMANDS = MODERATION_REPLY_COMMANDS | frozenset(
+    {
+        "rob",
+        "kill",
+        "revive",
+        "give",
+        "protect",
+        "checkprotect",
+        "marry",
+        "divorce",
+        "gift",
+        "hide",
+        "unhide",
+        "kiss",
+        "hug",
+        "slap",
+        "punch",
+        "murder",
+        "bite",
+        "crush",
+        "love",
+        "pat",
+        "cuddle",
+        "dance",
+        "highfive",
+        "bonk",
+    }
+)
 
 
 def pre_block(value: str) -> str:
@@ -685,6 +713,25 @@ def mention_row(row: sqlite3.Row | None) -> str:
     return (
         f'<a href="tg://user?id={int(row["user_id"])}">'
         f'{esc(row_label(row))}</a>'
+    )
+
+
+def mention_styled(user: Any) -> str:
+    """Clickable mention whose visible name matches Zara's small-caps font."""
+    name = esc(styled(clean_display_name(
+        getattr(user, "full_name", None)
+        or getattr(user, "username", None)
+        or str(user.id)
+    )))
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+
+def mention_row_styled(row: sqlite3.Row | None) -> str:
+    if not row:
+        return styled("unknown user")
+    return (
+        f'<a href="tg://user?id={int(row["user_id"])}">'
+        f'{esc(styled(row_label(row)))}</a>'
     )
 
 
@@ -1248,7 +1295,7 @@ def leaderboard_marker(row: sqlite3.Row) -> str:
 
 
 def leaderboard_name(row: sqlite3.Row) -> str:
-    return esc(str(row["name"] or "Telegram user"))
+    return esc(styled(str(row["name"] or "Telegram user")))
 
 
 def leaderboard_text(
@@ -1267,7 +1314,7 @@ def leaderboard_text(
             "✅ ᴜᴘɢʀᴀᴅᴇ ᴛᴏ ᴘʀᴇᴍɪᴜᴍ: /pay",
         ]
     )
-    return "\n".join(lines), None
+    return "<blockquote>" + "\n".join(lines) + "</blockquote>", None
 
 
 def number_arg(update: Update, default: int = 0) -> int:
@@ -1284,7 +1331,10 @@ def ipv4_async_client(**kwargs: Any) -> httpx.AsyncClient:
 
 
 async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
-    if message_command(update) in MODERATION_REPLY_COMMANDS:
+    if (
+        message_command(update) in FORMAT_REPLY_COMMANDS
+        and not text.lstrip().startswith(("<pre>", "<blockquote>"))
+    ):
         text = pre_or_quote(text)
     if update.effective_message:
         try:
@@ -3235,15 +3285,24 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if claimed is None:
         fresh = STORE.user(update.effective_user)
         hours = max(1, (86400 - (now() - int(fresh["last_daily"]))) // 3600)
-        await safe_reply(update, f"⏳ ᴅᴀɪʟʏ ʀᴇᴡᴀʀᴅ ᴄᴏᴍᴇs ʙᴀᴄᴋ ɪɴ {hours}ʜ.")
+        await safe_reply(
+            update,
+            pre_or_quote(f"⏳ ᴅᴀɪʟʏ ʀᴇᴡᴀʀᴅ ᴄᴏᴍᴇs ʙᴀᴄᴋ ɪɴ {hours}ʜ."),
+        )
         return
-    await safe_reply(update, f"🎁 ᴅᴀɪʟʏ ᴄʟᴀɪᴍᴇᴅ: <b>${reward:,}</b>\n🔥 sᴛʀᴇᴀᴋ: {int(claimed['streak'])}")
+    await safe_reply(
+        update,
+        pre_or_quote(
+            f"🎁 ᴅᴀɪʟʏ ᴄʟᴀɪᴍᴇᴅ: ${reward:,}\n"
+            f"🔥 sᴛʀᴇᴀᴋ: {int(claimed['streak'])}"
+        ),
+    )
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = ranking_rows("balance")
     text, markup = leaderboard_text(rows, "ᴢᴀʀᴀ ᴛᴏᴘ 10 ʀɪᴄʜᴇsᴛ")
-    await safe_reply(update, text if rows else "🏆 ɴᴏ ᴘʟᴀʏᴇʀs ʏᴇᴛ.", reply_markup=markup)
+    await safe_reply(update, text, reply_markup=markup)
 
 
 async def toprich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3255,23 +3314,35 @@ async def toprich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         rows = ranking_rows("balance")
         text, markup = leaderboard_text(rows, "ɢʟᴏʙᴀʟ ᴛᴏᴘ 10 ʀɪᴄʜᴇsᴛ")
-    await safe_reply(update, text if rows else "🏆 ɴᴏ ᴘʟᴀʏᴇʀs ʏᴇᴛ.", reply_markup=markup)
+    await safe_reply(update, text, reply_markup=markup)
 
 
 async def topkill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = ranking_rows("kills")
-    lines = ["⚔️ <b>ᴛᴏᴘ ᴋɪʟʟᴇʀs</b>"]
+    lines = [f"⚔️ <b>{styled('Top Killers')}</b>", DIVIDER]
     for index, row in enumerate(rows, 1):
-        lines.append(f"{index}. {esc(row['name'])} — ⚔️ {row['kills']}")
-    await safe_reply(update, "\n".join(lines) if rows else "⚔️ ɴᴏ ᴋɪʟʟs ʏᴇᴛ.")
+        name = esc(styled(str(row["name"] or "Telegram user")))
+        lines.append(f"{index}. {name} — ⚔️ {row['kills']}")
+    text = (
+        "<blockquote>" + "\n".join(lines) + "</blockquote>"
+        if rows
+        else f"<blockquote>{styled('no kills yet')}</blockquote>"
+    )
+    await safe_reply(update, text)
 
 
 async def game_leaders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = ranking_rows("xp")
-    lines = ["🎮 <b>ɢᴀᴍᴇ ʟᴇᴀᴅᴇʀs</b>"]
+    lines = [f"🎮 <b>{styled('Game Leaders')}</b>", DIVIDER]
     for index, row in enumerate(rows, 1):
-        lines.append(f"{index}. {esc(row['name'])} — ⭐ {row['xp']} xᴘ")
-    await safe_reply(update, "\n".join(lines) if rows else "🎮 ɴᴏ ɢᴀᴍᴇ sᴛᴀᴛs ʏᴇᴛ.")
+        name = esc(styled(str(row["name"] or "Telegram user")))
+        lines.append(f"{index}. {name} — ⭐ {row['xp']} xᴘ")
+    text = (
+        "<blockquote>" + "\n".join(lines) + "</blockquote>"
+        if rows
+        else f"<blockquote>{styled('no game stats yet')}</blockquote>"
+    )
+    await safe_reply(update, text)
 
 
 async def give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3904,32 +3975,36 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not target:
         await safe_reply(update, f"ʀᴇᴘʟʏ ᴛᴏ sᴏᴍᴇᴏɴᴇ ᴛᴏ {command} ᴛʜᴇᴍ.")
         return
-    actor = display_name(update.effective_user)
-    target_name = display_name_row(target)
+    actor = mention_styled(update.effective_user)
+    target_name = mention_row_styled(target)
     level = pair_value(update.effective_user.id, target_id)
     phrases = {
-        "kiss": f"💋 {actor} ᴋɪssᴇᴅ {target_name}. ᴄᴜᴛᴇᴇᴇ!",
-        "hug": f"🤗 {actor} ɢᴀᴠᴇ {target_name} ᴀ ᴡᴀʀᴍ ʜᴜɢ.",
-        "slap": f"🫲 {actor} sʟᴀᴘᴘᴇᴅ {target_name}.",
-        "punch": f"🥊 {actor} ᴘᴜɴᴄʜᴇᴅ {target_name}.",
-        "murder": f"🔪 {actor} ᴅɪᴅ ᴀ ᴅʀᴀᴍᴀᴛɪᴄ ᴍᴜʀᴅᴇʀ sᴄᴇɴᴇ ᴡɪᴛʜ {target_name}.",
-        "bite": f"🧛 {actor} ʙɪᴛ {target_name}.",
+        "kiss": f"💋 {actor} {styled('kissed')} {target_name}. {styled('cuteee!')}",
+        "hug": f"🤗 {actor} {styled('gave')} {target_name} {styled('a warm hug.')}",
+        "slap": f"🫲 {actor} {styled('slapped')} {target_name}.",
+        "punch": f"🥊 {actor} {styled('punched')} {target_name}.",
+        "murder": f"🔪 {actor} {styled('did a dramatic murder scene with')} {target_name}.",
+        "bite": f"🧛 {actor} {styled('bit')} {target_name}.",
         "crush": (
-            f"💘 {target_name}'s sᴇᴄʀᴇᴛ ᴄʀᴜsʜ ɪs {actor} 🫀🧿🎀\n"
-            f"ᴄʀᴜsʜ ʟᴇᴠᴇʟ: {level}% ❤️"
+            f"💘 {target_name}{styled(chr(39) + 's secret crush is')} {actor} 🫀🧿🎀\n"
+            f"{styled('crush level:')} {level}% ❤️"
         ),
         "love": (
-            "❤️ ʟᴏᴠᴇ ᴍᴇᴛᴇʀ ʀᴇᴘᴏʀᴛ ❤️\n"
+            f"❤️ {styled('love meter report')} ❤️\n"
             f"{actor} ❤️ {target_name}\n"
-            f"ʟᴏᴠᴇ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ: {level}% ❤️"
+            f"{styled('love compatibility:')} {level}% ❤️"
         ),
-        "pat": f"🌸 {actor} ᴘᴀᴛᴛᴇᴅ {target_name}.",
-        "cuddle": f"🫂 {actor} ᴄᴜᴅᴅʟᴇᴅ {target_name}.",
-        "dance": f"💃 {actor} ᴅᴀɴᴄᴇᴅ ᴡɪᴛʜ {target_name}.",
-        "highfive": f"🙌 {actor} ɢᴀᴠᴇ {target_name} ᴀ ʜɪɢʜ ғɪᴠᴇ.",
-        "bonk": f"🔨 {actor} ʙᴏɴᴋᴇᴅ {target_name}.",
+        "pat": f"🌸 {actor} {styled('patted')} {target_name}.",
+        "cuddle": f"🫂 {actor} {styled('cuddled')} {target_name}.",
+        "dance": f"💃 {actor} {styled('danced with')} {target_name}.",
+        "highfive": f"🙌 {actor} {styled('gave')} {target_name} {styled('a high five.')}",
+        "bonk": f"🔨 {actor} {styled('bonked')} {target_name}.",
     }
-    caption = pre_or_quote(phrases.get(command, f"💗 {actor} ᴡɪᴛʜ {target_name}."))
+    caption = (
+        "<blockquote>"
+        + phrases.get(command, f"💗 {actor} {styled('with')} {target_name}.")
+        + "</blockquote>"
+    )
 
     # Prefer the configured GIPHY source, then use the bundled animations.
     giphy = await giphy_animation(command)
@@ -5452,7 +5527,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text, markup = leaderboard_text(rows, "ᴢᴀʀᴀ ᴛᴏᴘ 10 ʀɪᴄʜᴇsᴛ")
         await edit_callback_message(
             query,
-            text if rows else "🏆 ɴᴏ ᴘʟᴀʏᴇʀs ʏᴇᴛ.",
+            text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
@@ -5461,7 +5536,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text, markup = leaderboard_text(rows, "ɢʟᴏʙᴀʟ ᴛᴏᴘ 10 ʀɪᴄʜᴇsᴛ")
         await edit_callback_message(
             query,
-            text if rows else "🏆 ɴᴏ ᴘʟᴀʏᴇʀs ʏᴇᴛ.",
+            text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
