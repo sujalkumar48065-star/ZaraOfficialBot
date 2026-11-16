@@ -436,3 +436,77 @@ def test_verification_is_optional_when_channel_not_configured(monkeypatch):
 
     assert zara_bot.normal_user_verified(None) is True
     assert not zara_bot.verification_markup().inline_keyboard
+
+
+def test_short_replies_use_pre_and_long_replies_fall_back_to_blockquote():
+    assert zara_bot.pre_or_quote("short reply").startswith("<pre>")
+    long_text = "x" * (zara_bot.PRE_TEXT_MAX + 1)
+    assert zara_bot.pre_or_quote(long_text).startswith("<blockquote>")
+
+
+def test_leaderboard_back_button_does_not_force_main_menu():
+    _, markup = zara_bot.leaderboard_text([], "Top")
+    callbacks = [
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+    assert "cat:economy" in callbacks
+    assert "nav:home" not in callbacks
+
+
+def test_profile_and_start_stats_use_pre_formatting(store):
+    user = SimpleNamespace(id=704, username="pre", full_name="Pre User", is_bot=False)
+    row = store.user(user)
+
+    profile = zara_bot.profile_text(row, user.id)
+    start = zara_bot.start_message(user, row)
+
+    assert profile.startswith("<pre>")
+    assert "ʙᴀʟᴀɴᴄᴇ" in profile
+    assert "<pre>" in start
+    assert "ʙᴀʟᴀɴᴄᴇ" in start
+
+
+@pytest.mark.asyncio
+async def test_ban_dm_hint_does_not_mention_quicksettings(monkeypatch):
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    chat = SimpleNamespace(id=1, type=ChatType.PRIVATE, title=None)
+    message = SimpleNamespace(text="/ban", message_id=1, reply_to_message=None)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_user=SimpleNamespace(id=1, full_name="Admin", username="admin"),
+        effective_message=message,
+    )
+
+    await zara_bot.group_settings(update, SimpleNamespace(args=[]))
+
+    hint = reply.await_args.args[1]
+    assert "quicksettings" not in hint.lower()
+
+
+@pytest.mark.asyncio
+async def test_protection_dm_hint_still_mentions_quicksettings(monkeypatch):
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    chat = SimpleNamespace(id=1, type=ChatType.PRIVATE, title=None)
+    message = SimpleNamespace(text="/antilink", message_id=1, reply_to_message=None)
+    update = SimpleNamespace(
+        effective_chat=chat,
+        effective_user=SimpleNamespace(id=1, full_name="Admin", username="admin"),
+        effective_message=message,
+    )
+
+    await zara_bot.group_settings(update, SimpleNamespace(args=[]))
+
+    hint = reply.await_args.args[1]
+    assert "quicksettings" in hint.lower()
+
+
+def test_link_protection_pattern_catches_common_invite_and_url_forms():
+    assert zara_bot.LINK_PATTERN.search("https://example.com")
+    assert zara_bot.LINK_PATTERN.search("t.me/somegroup")
+    assert zara_bot.LINK_PATTERN.search("joinchat/abc")
+    assert zara_bot.LINK_PATTERN.search("example.xyz")
+    assert not zara_bot.LINK_PATTERN.search("hello world")

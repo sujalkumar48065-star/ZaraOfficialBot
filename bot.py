@@ -572,6 +572,56 @@ def esc(value: str | None) -> str:
     return html.escape(value or "unknown", quote=False)
 
 
+PRE_TEXT_MAX = 220
+MODERATION_REPLY_COMMANDS = frozenset(
+    {
+        "ban",
+        "tban",
+        "unban",
+        "kick",
+        "mute",
+        "tmute",
+        "unmute",
+        "warn",
+        "warnings",
+        "resetwarns",
+        "promote",
+        "demote",
+        "pin",
+        "unpin",
+        "purge",
+        "del",
+        "lock",
+        "unlock",
+        "approve",
+        "disapprove",
+        "admins",
+    }
+)
+
+
+def pre_block(value: str) -> str:
+    """Always render text as a monospace pre block."""
+    return f"<pre>{html.escape(value, quote=False)}</pre>"
+
+
+def pre_or_quote(value: str, limit: int = PRE_TEXT_MAX) -> str:
+    """Use pre for short replies, blockquote as the long-text fallback."""
+    plain = html.unescape(re.sub(r"<[^>]+>", "", value))
+    safe = html.escape(plain, quote=False)
+    if len(plain) > limit or plain.count("\n") > 2:
+        return f"<blockquote>{safe}</blockquote>"
+    return f"<pre>{safe}</pre>"
+
+
+def message_command(update: Update) -> str:
+    message = getattr(update, "effective_message", None)
+    text = getattr(message, "text", None) or ""
+    if not text.startswith("/"):
+        return ""
+    return text.split()[0].lstrip("/").split("@", 1)[0].lower()
+
+
 def clean_display_name(value: str | None) -> str:
     """Remove profile decorations that make action captions noisy."""
     name = unicodedata.normalize("NFKC", value or "Telegram user").strip()
@@ -1225,7 +1275,9 @@ def leaderboard_text(
             ]
         )
         if include_global_button
-        else category_keyboard()
+        else InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="cat:economy")]]
+        )
     )
     return "\n".join(lines), markup
 
@@ -1244,6 +1296,8 @@ def ipv4_async_client(**kwargs: Any) -> httpx.AsyncClient:
 
 
 async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
+    if message_command(update) in MODERATION_REPLY_COMMANDS:
+        text = pre_or_quote(text)
     if update.effective_message:
         try:
             return await update.effective_message.reply_text(
@@ -1702,15 +1756,15 @@ def profile_text(row: sqlite3.Row, viewer_id: int | None = None) -> str:
     rank = profile_rank(row)
     bal = "👑 OWNER BALANCE" if owner(int(row["user_id"])) else "🛡️ ADMIN BALANCE" if int(row["user_id"]) in ADMIN_IDS else display_balance(row, viewer_id)
     gems = "∞" if staff(int(row["user_id"])) else f"{row['gems']:,}"
-    return (
-        f"👤 <b>ɴᴀᴍᴇ:</b> {esc(row['name'])}\n"
-        f"💰 <b>ʙᴀʟᴀɴᴄᴇ:</b> {bal}\n"
-        f"💎 <b>ɢᴇᴍs:</b> {gems}\n"
-        f"🏆 <b>ɢʟᴏʙᴀʟ ʀᴀɴᴋ:</b> {rank}\n"
-        f"🔓 <b>sᴛᴀᴛᴜs:</b> {status}\n"
-        f"⚔️ <b>ᴋɪʟʟs:</b> {row['kills']}\n"
-        f"🟤 <b>ʟᴇᴠᴇʟ {level}:</b> {progress}/2000\n"
-        f"🛡️ <b>ᴘʀᴏᴛᴇᴄᴛɪᴏɴ:</b> {protection_text(row, int(row['user_id']))}"
+    return pre_block(
+        f"👤 ɴᴀᴍᴇ: {row['name'] or 'Telegram user'}\n"
+        f"💰 ʙᴀʟᴀɴᴄᴇ: {bal}\n"
+        f"💎 ɢᴇᴍs: {gems}\n"
+        f"🏆 ɢʟᴏʙᴀʟ ʀᴀɴᴋ: {rank}\n"
+        f"🔓 sᴛᴀᴛᴜs: {status}\n"
+        f"⚔️ ᴋɪʟʟs: {row['kills']}\n"
+        f"🟤 ʟᴇᴠᴇʟ {level}: {progress}/2000\n"
+        f"🛡️ ᴘʀᴏᴛᴇᴄᴛɪᴏɴ: {protection_text(row, int(row['user_id']))}"
     )
 
 
@@ -2020,11 +2074,13 @@ def start_message(user: Any, row: sqlite3.Row) -> str:
         "ɪ'ᴍ <b>ᴢᴀʀᴀ</b> — ᴀ ɢᴀᴍɪɴɢ ᴀɴᴅ ᴄʜᴀᴛᴛɪɴɢ ɢɪʀʟ "
         "ʜᴀᴠɪɴɢ ʟᴏᴛs ᴏғ ғᴇᴀᴛᴜʀᴇs ᴛᴏ ᴇɴɢᴀɢᴇ ʏᴏᴜʀ ɢʀᴏᴜᴘ.\n\n"
         "📊 <b>ʏᴏᴜʀ sᴛᴀᴛs:</b>\n"
-        f"💰 ʙᴀʟᴀɴᴄᴇ: {display_balance(row, user.id)}\n"
-        f"🏆 ʀᴀɴᴋ: {profile_rank(row)}\n"
-        f"💎 ɢᴇᴍs: {row['gems']:,}\n"
-        f"🔪 ᴋɪʟʟs: {row['kills']}\n\n"
-        "👇 <b>ᴛᴀᴘ ᴇxᴘʟᴏʀᴇ ᴛᴏ sᴇᴇ ᴇᴠᴇʀʏ ᴄᴏᴍᴍᴀɴᴅ.</b>"
+        + pre_block(
+            f"💰 ʙᴀʟᴀɴᴄᴇ: {display_balance(row, user.id)}\n"
+            f"🏆 ʀᴀɴᴋ: {profile_rank(row)}\n"
+            f"💎 ɢᴇᴍs: {row['gems']:,}\n"
+            f"🔪 ᴋɪʟʟs: {row['kills']}"
+        )
+        + "\n\n👇 <b>ᴛᴀᴘ ᴇxᴘʟᴏʀᴇ ᴛᴏ sᴇᴇ ᴇᴠᴇʀʏ ᴄᴏᴍᴍᴀɴᴅ.</b>"
     )
 
 
@@ -2294,11 +2350,29 @@ async def relationship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     command = (update.effective_message.text or "").split()[0].lstrip("/").split("@", 1)[0].lower()
     if not update.effective_chat or update.effective_chat.type == ChatType.PRIVATE:
-        await safe_reply(
-            update,
-            "🛡️ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ ᴄᴏᴍᴍᴀɴᴅs ᴡᴏʀᴋ ɪɴ ɢʀᴏᴜᴘs.\n"
-            "ᴀᴅᴅ ᴢᴀʀᴀ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ ᴀɴᴅ ᴜsᴇ /quicksettings ᴛᴏ ᴄᴏɴғɪɢᴜʀᴇ ɪᴛ.",
-        )
+        if command in MODERATION_REPLY_COMMANDS or command in {
+            "setwelcome",
+            "setgoodbye",
+            "setrules",
+            "setflood",
+            "warnlimit",
+            "setwarnaction",
+            "filter",
+            "stop",
+            "filters",
+            "logs",
+            "report",
+        }:
+            hint = (
+                "🛡️ ᴛʜɪs ᴄᴏᴍᴍᴀɴᴅ ᴡᴏʀᴋs ɪɴ ɢʀᴏᴜᴘs.\n"
+                "ᴀᴅᴅ ᴢᴀʀᴀ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ ᴀɴᴅ ᴜsᴇ ɪᴛ ᴛʜᴇʀᴇ."
+            )
+        else:
+            hint = (
+                "🛡️ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ ᴄᴏᴍᴍᴀɴᴅs ᴡᴏʀᴋ ɪɴ ɢʀᴏᴜᴘs.\n"
+                "ᴀᴅᴅ ᴢᴀʀᴀ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ ᴀɴᴅ ᴜsᴇ /quicksettings ᴛᴏ ᴄᴏɴғɪɢᴜʀᴇ ɪᴛ."
+            )
+        await safe_reply(update, hint)
         return
     chat = update.effective_chat
     row = STORE.chat(chat.id, chat.title or "")
@@ -3842,8 +3916,8 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not target:
         await safe_reply(update, f"ʀᴇᴘʟʏ ᴛᴏ sᴏᴍᴇᴏɴᴇ ᴛᴏ {command} ᴛʜᴇᴍ.")
         return
-    actor = mention(update.effective_user)
-    target_name = mention_row(target)
+    actor = display_name(update.effective_user)
+    target_name = display_name_row(target)
     level = pair_value(update.effective_user.id, target_id)
     phrases = {
         "kiss": f"💋 {actor} ᴋɪssᴇᴅ {target_name}. ᴄᴜᴛᴇᴇᴇ!",
@@ -3854,12 +3928,12 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "bite": f"🧛 {actor} ʙɪᴛ {target_name}.",
         "crush": (
             f"💘 {target_name}'s sᴇᴄʀᴇᴛ ᴄʀᴜsʜ ɪs {actor} 🫀🧿🎀\n"
-            f"ᴄʀᴜsʜ ʟᴇᴠᴇʟ: <b>{level}%</b> ❤️"
+            f"ᴄʀᴜsʜ ʟᴇᴠᴇʟ: {level}% ❤️"
         ),
         "love": (
-            "❤️ <b>ʟᴏᴠᴇ ᴍᴇᴛᴇʀ ʀᴇᴘᴏʀᴛ</b> ❤️\n"
+            "❤️ ʟᴏᴠᴇ ᴍᴇᴛᴇʀ ʀᴇᴘᴏʀᴛ ❤️\n"
             f"{actor} ❤️ {target_name}\n"
-            f"ʟᴏᴠᴇ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ: <b>{level}%</b> ❤️"
+            f"ʟᴏᴠᴇ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ: {level}% ❤️"
         ),
         "pat": f"🌸 {actor} ᴘᴀᴛᴛᴇᴅ {target_name}.",
         "cuddle": f"🫂 {actor} ᴄᴜᴅᴅʟᴇᴅ {target_name}.",
@@ -3867,7 +3941,7 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "highfive": f"🙌 {actor} ɢᴀᴠᴇ {target_name} ᴀ ʜɪɢʜ ғɪᴠᴇ.",
         "bonk": f"🔨 {actor} ʙᴏɴᴋᴇᴅ {target_name}.",
     }
-    caption = phrases.get(command, f"💗 {actor} ᴡɪᴛʜ {target_name}.")
+    caption = pre_or_quote(phrases.get(command, f"💗 {actor} ᴡɪᴛʜ {target_name}."))
 
     # Prefer the configured GIPHY source, then use the bundled animations.
     giphy = await giphy_animation(command)
@@ -5447,6 +5521,7 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 getattr(message, "photo", None)
                 or getattr(message, "video", None)
                 or getattr(message, "video_note", None)
+                or getattr(message, "animation", None)
             ):
                 violation = "antimedia"
             elif settings.get("antisticker") and (
