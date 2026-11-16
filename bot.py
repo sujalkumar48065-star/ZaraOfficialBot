@@ -638,17 +638,25 @@ def mention_row(row: sqlite3.Row | None) -> str:
     )
 
 
-def violation_warning(violation: str, user: Any) -> str:
+def matches_filter_word(text: str, word: str) -> bool:
+    word = word.strip().lower()
+    if not word:
+        return False
+    return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text.lower()) is not None
+
+
+def violation_warning(violation: str, user: Any, removed: bool = True) -> str:
     label = modcfg.PROTECTION_LABELS.get(violation, "protection")
     reason = VIOLATION_WARNINGS.get(
         violation, "this message is not allowed in this group"
     )
+    footer = "message removed" if removed else "could not remove message — check my delete rights"
     return (
         f"🚫 <b>{styled(label)}</b>\n"
         f"{DIVIDER}\n"
         f"<blockquote>▫️ {mention(user)}, {styled(reason)}</blockquote>\n"
         f"{DIVIDER}\n"
-        f"📌 {styled('message removed')}"
+        f"📌 {styled(footer)}"
     )
 
 
@@ -666,6 +674,27 @@ def full_member_permissions() -> ChatPermissions:
         can_add_web_page_previews=True,
         can_react_to_messages=True,
     )
+
+
+def locked_permissions() -> ChatPermissions:
+    return ChatPermissions(
+        can_send_messages=False,
+        can_send_audios=False,
+        can_send_documents=False,
+        can_send_photos=False,
+        can_send_videos=False,
+        can_send_video_notes=False,
+        can_send_voice_notes=False,
+        can_send_polls=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
+        can_react_to_messages=False,
+    )
+
+
+def chat_default_permissions(chat: Any) -> ChatPermissions:
+    permissions = getattr(chat, "permissions", None)
+    return permissions if isinstance(permissions, ChatPermissions) else full_member_permissions()
 
 
 def render_template(template: str, user: Any, chat: Any) -> str:
@@ -930,10 +959,11 @@ class Store:
         """Atomically claim /daily; returns the fresh row or None on cooldown."""
         stamp = now()
         result = self.db.execute(
-            """UPDATE users SET last_daily=?, streak=streak+1, xp=xp+?,
-               balance=balance+?, updated_at=?
+            """UPDATE users SET last_daily=?,
+               streak=CASE WHEN last_daily>=? THEN streak+1 ELSE 1 END,
+               xp=xp+?, balance=balance+?, updated_at=?
                WHERE user_id=? AND (last_daily=0 OR last_daily<=?)""",
-            (stamp, xp, reward, stamp, user_id, stamp - 86400),
+            (stamp, stamp - 2 * 86400, xp, reward, stamp, user_id, stamp - 86400),
         )
         self.db.commit()
         if result.rowcount != 1:
@@ -1089,9 +1119,11 @@ def telegram_web_app_user_id(init_data: str, bot_token: str) -> int | None:
 
 
 def verification_markup() -> InlineKeyboardMarkup:
-    buttons = [[
-        InlineKeyboardButton("📢 Join updates", url=UPDATE_CHANNEL_URL),
-    ]]
+    buttons = []
+    if UPDATE_CHANNEL_URL:
+        buttons.append([
+            InlineKeyboardButton("📢 Join updates", url=UPDATE_CHANNEL_URL),
+        ])
     if VERIFY_WEBAPP_URL:
         buttons.append([
             InlineKeyboardButton(
@@ -1103,6 +1135,8 @@ def verification_markup() -> InlineKeyboardMarkup:
 
 
 def normal_user_verified(row: sqlite3.Row | None) -> bool:
+    if not UPDATE_CHANNEL_CHAT_ID:
+        return True
     return bool(row and int(row["verified_at"] or 0) >= now() - 86400)
 
 
@@ -1216,10 +1250,13 @@ async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
                 text, parse_mode=ParseMode.HTML, **kwargs
             )
         except TelegramError:
-            return await update.effective_message.reply_text(
-                re.sub("<[^>]+>", "", text),
-                **{k: v for k, v in kwargs.items() if k != "parse_mode"},
-            )
+            try:
+                return await update.effective_message.reply_text(
+                    re.sub("<[^>]+>", "", text),
+                    **{k: v for k, v in kwargs.items() if k != "parse_mode"},
+                )
+            except TelegramError:
+                return None
     return None
 
 
@@ -1373,42 +1410,55 @@ async def apply_penalty(
     settings: dict[str, Any],
     reason: str,
     detail: str = "",
-) -> None:
+) -> str:
     action = action if action in modcfg.PENALTY_CYCLE else "nothing"
     outcome = "no action"
-    try:
-        if action == "ban":
-            await context.bot.ban_chat_member(chat.id, user_id)
-            outcome = "banned"
-        elif action == "mute":
-            await context.bot.restrict_chat_member(
-                chat.id,
-                user_id,
-                ChatPermissions(can_send_messages=False),
-                until_date=now() + 600,
-            )
-            outcome = "muted 10m"
-    except TelegramError:
-        outcome = f"{action} failed"
+    if action != "nothing":
+        allowed, reason_text = await bot_admin_check(
+            context, chat, "can_restrict_members"
+        )
+        if not allowed:
+            outcome = f"{action} failed — {re.sub('<[^>]+>', '', reason_text)}"
+        else:
+            member, error = await target_member(context, chat.id, user_id)
+            if not member:
+                outcome = f"{action} failed — {error.lstrip('❌ ')}"
+            elif member.status in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR}:
+                outcome = f"{action} skipped — protected admin"
+            else:
+                try:
+                    if action == "ban":
+                        await context.bot.ban_chat_member(chat.id, user_id)
+                        outcome = "banned"
+                    elif action == "mute":
+                        await context.bot.restrict_chat_member(
+                            chat.id,
+                            user_id,
+                            ChatPermissions(can_send_messages=False),
+                            until_date=now() + 600,
+                        )
+                        outcome = "muted 10m"
+                except TelegramError as exc:
+                    outcome = f"{action} failed — {type(exc).__name__}"
     suffix = f" → {esc(detail[:200])}" if detail else ""
     await send_mod_log(
         context,
         chat,
         f"🛡️ {reason}: {mention_row(STORE.db.execute('SELECT * FROM users WHERE user_id=?', (user_id,)).fetchone())}"
-        f" — <b>{outcome}</b>{suffix}",
+        f" — <b>{esc(outcome)}</b>{suffix}",
         settings,
     )
+    return outcome
 
 
 async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_chat or update.effective_chat.type == ChatType.PRIVATE:
+    chat = update.effective_chat
+    if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return False
     if staff(update.effective_user.id):
         return True
     try:
-        member = await context.bot.get_chat_member(
-            update.effective_chat.id, update.effective_user.id
-        )
+        member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
         return member.status in {
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER,
@@ -1417,33 +1467,179 @@ async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return False
 
 
+async def bot_admin_check(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    permission: str | None = None,
+) -> tuple[bool, str]:
+    """Check that Zara is an admin and, optionally, has one specific right."""
+    try:
+        member = await context.bot.get_chat_member(chat.id, context.bot.id)
+    except TelegramError:
+        return False, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴄʜᴇᴄᴋ ᴍʏ ᴀᴅᴍɪɴ ʀɪɢʜᴛs. ᴛʀʏ ᴀɢᴀɪɴ."
+    if member.status == ChatMemberStatus.OWNER:
+        return True, ""
+    if member.status != ChatMemberStatus.ADMINISTRATOR:
+        return False, "❌ ᴍᴀᴋᴇ ᴢᴀʀᴀ ᴀ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴ ғɪʀsᴛ."
+    if permission and not getattr(member, permission, False):
+        label = permission.replace("can_", "").replace("_", " ")
+        return False, f"❌ ɪ ɴᴇᴇᴅ ᴛʜᴇ <b>{esc(label)}</b> ᴀᴅᴍɪɴ ʀɪɢʜᴛ ғᴏʀ ᴛʜɪs."
+    return True, ""
+
+
+async def target_member(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+) -> tuple[Any | None, str]:
+    try:
+        return await context.bot.get_chat_member(chat_id, user_id), ""
+    except BadRequest:
+        return None, "❌ ᴜsᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ ɪɴ ᴛʜɪs ɢʀᴏᴜᴘ."
+    except TelegramError:
+        return None, "❌ ᴛᴇʟᴇɢʀᴀᴍ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴠᴇʀɪғʏ ᴛʜᴀᴛ ᴜsᴇʀ. ᴛʀʏ ᴀɢᴀɪɴ."
+
+
+async def validate_moderation_target(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    target_id: int,
+    command: str,
+    invoker_id: int,
+) -> tuple[Any | None, str]:
+    if target_id <= 0:
+        return None, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ ᴏʀ ᴜsᴇ ᴀ ᴠᴀʟɪᴅ @ᴜsᴇʀɴᴀᴍᴇ/ɪᴅ."
+    if target_id == context.bot.id:
+        return None, "❌ ɪ ᴄᴀɴ'ᴛ ᴍᴏᴅᴇʀᴀᴛᴇ ᴍʏsᴇʟғ."
+    if target_id == invoker_id:
+        return None, "❌ ʏᴏᴜ ᴄᴀɴ'ᴛ ᴍᴏᴅᴇʀᴀᴛᴇ ʏᴏᴜʀsᴇʟғ."
+    if staff(target_id):
+        return None, "🛡️ ᴢᴀʀᴀ sᴛᴀғғ ᴀʀᴇ ᴘʀᴏᴛᴇᴄᴛᴇᴅ ғʀᴏᴍ ɢʀᴏᴜᴘ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ."
+    member, error = await target_member(context, chat.id, target_id)
+    if not member:
+        return None, error
+    if member.status == ChatMemberStatus.OWNER:
+        return None, "🛡️ ᴛʜᴇ ɢʀᴏᴜᴘ ᴏᴡɴᴇʀ ɪs ᴘʀᴏᴛᴇᴄᴛᴇᴅ."
+    if member.status == ChatMemberStatus.ADMINISTRATOR and command != "demote":
+        return None, "🛡️ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴀʀᴇ ᴘʀᴏᴛᴇᴄᴛᴇᴅ. ᴅᴇᴍᴏᴛᴇ ᴛʜᴇᴍ ғɪʀsᴛ."
+    return member, ""
+
+
+_DURATION_RE = re.compile(r"^(\d+)([smhdw])?$", re.IGNORECASE)
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(value: str) -> int | None:
+    match = _DURATION_RE.fullmatch(value.strip())
+    if not match:
+        return None
+    seconds = int(match.group(1)) * _DURATION_UNITS[(match.group(2) or "s").lower()]
+    if seconds <= 0 or seconds > 366 * 86400:
+        return None
+    return seconds
+
+
+def duration_text(seconds: int) -> str:
+    for unit, size in (("ᴅ", 86400), ("ʜ", 3600), ("ᴍ", 60)):
+        if seconds >= size and seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+def split_duration_args(
+    args: list[str], has_reply: bool
+) -> tuple[int | None, list[str], str]:
+    parsed_values = [
+        (index, value, parsed)
+        for index, value in enumerate(args)
+        if (parsed := parse_duration(value)) is not None
+    ]
+    with_units = [
+        item for item in parsed_values if re.search(r"[smhdw]$", item[1], re.IGNORECASE)
+    ]
+    candidates = with_units or parsed_values
+    if not candidates:
+        return None, args, "❌ ɪɴᴄʟᴜᴅᴇ ᴀ ᴅᴜʀᴀᴛɪᴏɴ, ᴇ.ɢ. <code>10m</code>, <code>2h</code> ᴏʀ <code>1d</code>."
+    if has_reply:
+        if len(candidates) > 1:
+            return None, args, "❌ ᴜsᴇ ᴏɴʟʏ ᴏɴᴇ ᴅᴜʀᴀᴛɪᴏɴ."
+        index, _, seconds = candidates[0]
+        target_args = args[:index] + args[index + 1 :]
+        if target_args:
+            return None, args, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ ᴏʀ ᴘᴀss ᴀ ᴛᴀʀɢᴇᴛ, ɴᴏᴛ ʙᴏᴛʜ."
+        return seconds, [], ""
+    if with_units:
+        if len(with_units) > 1:
+            return None, args, "❌ ᴜsᴇ ᴏɴʟʏ ᴏɴᴇ ᴅᴜʀᴀᴛɪᴏɴ."
+        index, _, seconds = with_units[0]
+        target_args = args[:index] + args[index + 1 :]
+        if not target_args:
+            return None, args, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴜsᴇʀ ᴡɪᴛʜ ᴛʜᴇ ᴅᴜʀᴀᴛɪᴏɴ, ᴏʀ ᴜsᴇ <code>/tban @user 1h</code>."
+        return seconds, target_args, ""
+    if len(parsed_values) < 2:
+        return None, args, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴜsᴇʀ ᴡɪᴛʜ ᴛʜᴇ ᴅᴜʀᴀᴛɪᴏɴ, ᴏʀ ᴜsᴇ <code>/tban @user 1h</code>."
+    index, _, seconds = parsed_values[-1]
+    target_args = args[:index] + args[index + 1 :]
+    if not target_args:
+        return None, args, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴜsᴇʀ ᴡɪᴛʜ ᴛʜᴇ ᴅᴜʀᴀᴛɪᴏɴ, ᴏʀ ᴜsᴇ <code>/tban @user 1h</code>."
+    return seconds, target_args, ""
+
+
+def synthetic_user_row(user_id: int) -> dict[str, Any]:
+    """Represent a Telegram ID that has not used Zara, without creating a row."""
+    return {
+        "user_id": user_id,
+        "username": None,
+        "name": f"Telegram user {user_id}",
+        "balance": 0,
+        "gems": 0,
+        "xp": 0,
+        "kills": 0,
+        "dead": 0,
+        "protection_until": 0,
+        "hide_balance": 0,
+    }
+
+
 async def send_mod_log(
     context: ContextTypes.DEFAULT_TYPE,
     chat: Any,
     text: str,
     settings: dict[str, Any] | None = None,
-) -> None:
+) -> str:
+    """Send a moderation log and return sent / not_configured / failed."""
     if settings is None:
         row = STORE.chat(chat.id, chat.title or "")
         settings = modcfg.load_settings(row)
     channel = settings.get("log_channel") or 0
-    if not channel:
-        return
+    if not channel or not settings.get("log_enabled", True):
+        return "not_configured"
     try:
         await context.bot.send_message(
             chat_id=int(channel),
             text=f"🛡️ <b>{esc(getattr(chat, 'title', None) or 'group')}</b>\n{text}",
             parse_mode=ParseMode.HTML,
         )
+        return "sent"
     except TelegramError as exc:
         log.info("Moderation log failed for %s: %s", channel, type(exc).__name__)
+        return "failed"
 
 
-async def target_user(update: Update, args: list[str]) -> tuple[int, sqlite3.Row | None]:
+async def target_user(
+    update: Update,
+    args: list[str],
+    *,
+    allow_synthetic: bool = False,
+) -> tuple[int, Any | None]:
     message = update.effective_message
-    if message and message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        return u.id, STORE.user(u)
+    if message and message.reply_to_message:
+        replied_user = message.reply_to_message.from_user
+        if not replied_user:
+            # Channel posts and anonymous admins have no from_user. Never fall
+            # back to the command sender in that case.
+            return 0, None
+        return replied_user.id, STORE.user(replied_user)
     if args:
         # Commands such as /give 500 @user have an amount before the target.
         # Prefer an @username, then the last numeric argument when there are
@@ -1455,15 +1651,11 @@ async def target_user(update: Update, args: list[str]) -> tuple[int, sqlite3.Row
         row = STORE.by_ref(ref)
         if row:
             return int(row["user_id"]), row
-        # An ID can be looked up even if that user has not opened Zara yet.
+        # A numeric ID can be moderated even before that user has opened Zara.
+        # Do not insert a synthetic row: that would create free starter coins.
         if ref.strip().isdigit():
             user_id = int(ref.strip())
-            synthetic = type(
-                "SyntheticUser",
-                (),
-                {"id": user_id, "username": None, "full_name": f"Telegram user {user_id}"},
-            )()
-            return user_id, STORE.user(synthetic)
+            return (user_id, synthetic_user_row(user_id)) if allow_synthetic else (0, None)
         # Do not silently target the sender when an explicit username is
         # unknown. Users can reply to a message to target anyone reliably.
         return 0, None
@@ -1875,24 +2067,58 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(
                         [[
-                            InlineKeyboardButton("➕ ᴏᴘᴇɴ ᴢᴀʀᴀ", url=f"https://t.me/{context.application.bot_data.get('username', 'ZaraBot')}"),
-                            InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇs", url=UPDATE_CHANNEL_URL),
+                            InlineKeyboardButton(
+                                "➕ ᴏᴘᴇɴ ᴢᴀʀᴀ",
+                                url=(
+                                    "https://t.me/"
+                                    f"{context.application.bot_data.get('username', 'ZaraBot')}"
+                                ),
+                            ),
+                            *(
+                                [InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇs", url=UPDATE_CHANNEL_URL)]
+                                if UPDATE_CHANNEL_URL
+                                else []
+                            ),
                         ]]
                     ),
                 )
                 continue
             if settings.get("antibot"):
+                allowed, error = await bot_admin_check(
+                    context, chat, "can_restrict_members"
+                )
+                if not allowed:
+                    await send_mod_log(
+                        context,
+                        chat,
+                        f"🤖 {styled('anti-bot')}: ᴄᴏᴜʟᴅ ɴᴏᴛ ᴋɪᴄᴋ {mention(new_user)} — {esc(error)}",
+                        settings,
+                    )
+                    continue
                 try:
+                    member = await context.bot.get_chat_member(chat.id, new_user.id)
+                    if member.status in {
+                        ChatMemberStatus.ADMINISTRATOR,
+                        ChatMemberStatus.OWNER,
+                    }:
+                        continue
                     await context.bot.ban_chat_member(chat.id, new_user.id)
-                    await context.bot.unban_chat_member(chat.id, new_user.id)
+                    await context.bot.unban_chat_member(
+                        chat.id, new_user.id, only_if_banned=True
+                    )
                     await send_mod_log(
                         context,
                         chat,
                         f"🤖 {styled('anti-bot')}: {mention(new_user)} ᴋɪᴄᴋᴇᴅ.",
                         settings,
                     )
-                except TelegramError:
-                    pass
+                except TelegramError as exc:
+                    await send_mod_log(
+                        context,
+                        chat,
+                        f"🤖 {styled('anti-bot')}: ᴄᴏᴜʟᴅ ɴᴏᴛ ᴋɪᴄᴋ {mention(new_user)} — {type(exc).__name__}",
+                        settings,
+                    )
             continue
         STORE.user(new_user)
         if settings.get("welcome_enabled"):
@@ -1902,13 +2128,43 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await update.message.reply_text(text, parse_mode=ParseMode.HTML)
             except TelegramError:
                 await update.message.reply_text(re.sub("<[^>]+>", "", text))
-        if settings.get("captcha"):
+        approved = STORE.db.execute(
+            "SELECT 1 FROM approvals WHERE chat_id=? AND user_id=?",
+            (chat.id, new_user.id),
+        ).fetchone()
+        if settings.get("captcha") and not approved:
+            allowed, error = await bot_admin_check(
+                context, chat, "can_restrict_members"
+            )
+            if not allowed:
+                await send_mod_log(
+                    context,
+                    chat,
+                    f"🛡️ ᴄᴀᴘᴛᴄʜᴀ sᴋɪᴘᴘᴇᴅ ғᴏʀ {mention(new_user)} — {esc(error)}",
+                    settings,
+                )
+                continue
             try:
+                member = await context.bot.get_chat_member(chat.id, new_user.id)
+                if member.status in {
+                    ChatMemberStatus.ADMINISTRATOR,
+                    ChatMemberStatus.OWNER,
+                }:
+                    continue
                 await context.bot.restrict_chat_member(
                     chat.id,
                     new_user.id,
                     ChatPermissions(can_send_messages=False),
                 )
+            except TelegramError as exc:
+                await send_mod_log(
+                    context,
+                    chat,
+                    f"🛡️ ᴄᴀᴘᴛᴄʜᴀ ᴄᴏᴜʟᴅ ɴᴏᴛ ʀᴇsᴛʀɪᴄᴛ {mention(new_user)} — {type(exc).__name__}",
+                    settings,
+                )
+                continue
+            try:
                 await update.message.reply_text(
                     f"🛡️ {mention(new_user)}, ᴘʟᴇᴀsᴇ ᴠᴇʀɪғʏ ʏᴏᴜ ᴀʀᴇ ʜᴜᴍᴀɴ.",
                     parse_mode=ParseMode.HTML,
@@ -1922,7 +2178,20 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     ),
                 )
             except TelegramError:
-                pass
+                try:
+                    await context.bot.restrict_chat_member(
+                        chat.id,
+                        new_user.id,
+                        chat_default_permissions(chat),
+                    )
+                except TelegramError:
+                    pass
+                await send_mod_log(
+                    context,
+                    chat,
+                    f"🛡️ ᴄᴀᴘᴛᴄʜᴀ ᴘʀᴏᴍᴘᴛ ғᴀɪʟᴇᴅ ғᴏʀ {mention(new_user)}; ʀᴇsᴛʀɪᴄᴛɪᴏɴ ʀᴇᴠᴇʀsᴇᴅ.",
+                    settings,
+                )
         await send_mod_log(
             context,
             chat,
@@ -1979,18 +2248,39 @@ async def relationship(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if command == "marry":
         with STORE.transaction():
+            sender_partner = STORE.db.execute(
+                "SELECT partner_id FROM couples WHERE user_id=?",
+                (update.effective_user.id,),
+            ).fetchone()
+            target_partner = STORE.db.execute(
+                "SELECT partner_id FROM couples WHERE user_id=?", (target_id,)
+            ).fetchone()
+            if sender_partner or target_partner:
+                await safe_reply(update, "❌ ᴏɴᴇ ᴏғ ʏᴏᴜ ɪs ᴀʟʀᴇᴀᴅʏ ᴍᴀʀʀɪᴇᴅ.")
+                return
+            stamp = now()
             STORE.db.execute(
-                "INSERT OR REPLACE INTO couples(user_id,partner_id,married_at) VALUES(?,?,?)",
-                (update.effective_user.id, target_id, now()),
+                "INSERT INTO couples(user_id,partner_id,married_at) VALUES(?,?,?)",
+                (update.effective_user.id, target_id, stamp),
             )
             STORE.db.execute(
-                "INSERT OR REPLACE INTO couples(user_id,partner_id,married_at) VALUES(?,?,?)",
-                (target_id, update.effective_user.id, now()),
+                "INSERT INTO couples(user_id,partner_id,married_at) VALUES(?,?,?)",
+                (target_id, update.effective_user.id, stamp),
             )
-        await safe_reply(update, f"💍 {mention(update.effective_user)} ᴘʀᴏᴘᴏsᴇᴅ ᴛᴏ {mention_row(target)}. ᴄᴏɴɢʀᴀᴛs ᴄᴜᴛɪᴇs!")
+        await safe_reply(update, f"💍 {mention(update.effective_user)} ᴀɴᴅ {mention_row(target)} ᴀʀᴇ ɴᴏᴡ ᴍᴀʀʀɪᴇᴅ!")
     elif command == "divorce":
         with STORE.transaction():
-            STORE.db.execute("DELETE FROM couples WHERE user_id IN (?,?)", (update.effective_user.id, target_id))
+            partner = STORE.db.execute(
+                "SELECT partner_id FROM couples WHERE user_id=?",
+                (update.effective_user.id,),
+            ).fetchone()
+            if not partner or int(partner["partner_id"]) != target_id:
+                await safe_reply(update, f"❌ ʏᴏᴜ ᴀʀᴇ ɴᴏᴛ ᴍᴀʀʀɪᴇᴅ ᴛᴏ {mention_row(target)}.")
+                return
+            STORE.db.execute(
+                "DELETE FROM couples WHERE user_id IN (?,?)",
+                (update.effective_user.id, target_id),
+            )
         await safe_reply(update, f"💔 {mention(update.effective_user)} ᴀɴᴅ {mention_row(target)} ᴀʀᴇ ɴᴏᴡ sɪɴɢʟᴇ.")
     else:
         row = STORE.db.execute("SELECT partner_id FROM couples WHERE user_id=?", (target_id,)).fetchone()
@@ -2056,20 +2346,35 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not settings.get("reports"):
             await safe_reply(update, "📨 ʀᴇᴘᴏʀᴛs ᴀʀᴇ ᴏғғ ɪɴ ᴛʜɪs ɢʀᴏᴜᴘ.")
             return
-        target = update.message.reply_to_message if update.message else None
+        target = (
+            update.effective_message.reply_to_message
+            if update.effective_message
+            else None
+        )
         if not target:
             await safe_reply(update, "ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴍᴇssᴀɢᴇ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ʀᴇᴘᴏʀᴛ.")
             return
         reported = getattr(target, "from_user", None)
         detail = (target.text or target.caption or "media message")[:300]
-        await send_mod_log(
+        delivery = await send_mod_log(
             context,
             chat,
             f"🚨 {mention(update.effective_user)} ʀᴇᴘᴏʀᴛᴇᴅ "
             f"{mention(reported) if reported else 'a message'}:\n{esc(detail)}",
             settings,
         )
-        await safe_reply(update, "✅ ʀᴇᴘᴏʀᴛ sᴇɴᴛ ᴛᴏ ᴛʜᴇ ʟᴏɢ ᴄʜᴀɴɴᴇʟ.")
+        if delivery == "sent":
+            await safe_reply(update, "✅ ʀᴇᴘᴏʀᴛ sᴇɴᴛ ᴛᴏ ᴛʜᴇ ʟᴏɢ ᴄʜᴀɴɴᴇʟ.")
+        elif delivery == "not_configured":
+            await safe_reply(
+                update,
+                "❌ ɴᴏ ʟᴏɢ ᴄʜᴀɴɴᴇʟ ɪs ᴄᴏɴғɪɢᴜʀᴇᴅ. ᴀsᴋ ᴀ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴ ᴛᴏ ᴜsᴇ /logchannel.",
+            )
+        else:
+            await safe_reply(
+                update,
+                "❌ ᴛʜᴇ ʀᴇᴘᴏʀᴛ ᴄᴏᴜʟᴅ ɴᴏᴛ ʙᴇ sᴇɴᴛ ᴛᴏ ᴛʜᴇ ʟᴏɢ ᴄʜᴀɴɴᴇʟ.",
+            )
         return
     if command == "modstats":
         warnings = STORE.db.execute("SELECT COUNT(*) AS n FROM warnings WHERE chat_id=?", (chat.id,)).fetchone()["n"]
@@ -2145,25 +2450,64 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_reply(update, f"✅ {command} sᴀᴠᴇᴅ ғᴏʀ <code>{esc(word)}</code>.")
         return
     if command == "unblacklist":
-        word = value.lower()
-        STORE.db.execute("DELETE FROM blacklists WHERE chat_id=? AND word=?", (chat.id, word))
+        word = value.lower().strip()
+        if not word:
+            await safe_reply(update, "ᴜsᴇ /unblacklist ᴡᴏʀᴅ")
+            return
+        result = STORE.db.execute(
+            "DELETE FROM blacklists WHERE chat_id=? AND word=?", (chat.id, word)
+        )
         STORE.db.commit()
-        await safe_reply(update, "✅ ʙʟᴀᴄᴋʟɪsᴛ ᴜᴘᴅᴀᴛᴇᴅ.")
+        if result.rowcount:
+            await safe_reply(update, f"✅ ʀᴇᴍᴏᴠᴇᴅ <code>{esc(word)}</code> ғʀᴏᴍ ᴛʜᴇ ʙʟᴀᴄᴋʟɪsᴛ.")
+        else:
+            await safe_reply(update, f"ℹ️ <code>{esc(word)}</code> ɪs ɴᴏᴛ ʙʟᴀᴄᴋʟɪsᴛᴇᴅ.")
         return
     if command in {"stop", "stopall"}:
-        STORE.db.execute("DELETE FROM filters WHERE chat_id=?" + (" AND word=?" if command == "stop" else ""), ((chat.id, value.lower()) if command == "stop" else (chat.id,)))
+        if command == "stop" and not value.strip():
+            await safe_reply(update, "ᴜsᴇ /stop ᴡᴏʀᴅ")
+            return
+        if command == "stop":
+            result = STORE.db.execute(
+                "DELETE FROM filters WHERE chat_id=? AND word=?",
+                (chat.id, value.lower().strip()),
+            )
+        else:
+            result = STORE.db.execute(
+                "DELETE FROM filters WHERE chat_id=?", (chat.id,)
+            )
         STORE.db.commit()
-        await safe_reply(update, "✅ ғɪʟᴛᴇʀ ʀᴇᴍᴏᴠᴇᴅ." if command == "stop" else "✅ ᴀʟʟ ғɪʟᴛᴇʀs ʀᴇᴍᴏᴠᴇᴅ.")
+        if command == "stop":
+            if result.rowcount:
+                await safe_reply(update, f"✅ ʀᴇᴍᴏᴠᴇᴅ ғɪʟᴛᴇʀ <code>{esc(value.lower().strip())}</code>.")
+            else:
+                await safe_reply(update, f"ℹ️ ɴᴏ ғɪʟᴛᴇʀ ɴᴀᴍᴇᴅ <code>{esc(value.lower().strip())}</code>.")
+        else:
+            await safe_reply(update, f"✅ ʀᴇᴍᴏᴠᴇᴅ <b>{result.rowcount}</b> ғɪʟᴛᴇʀ(s).")
         return
     if command in {"approve", "disapprove"}:
-        target_id, target = await target_user(update, context.args)
         if not update.effective_message.reply_to_message and not context.args:
             await safe_reply(update, "ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ ᴏʀ ᴜsᴇ ᴛʜᴇɪʀ ɪᴅ.")
+            return
+        target_id, target = await target_user(
+            update, context.args, allow_synthetic=True
+        )
+        if target_id <= 0 or not target:
+            await safe_reply(update, "❌ ᴜsᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ. ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇɪʀ ᴍᴇssᴀɢᴇ ᴏʀ ᴜsᴇ ᴀ ᴠᴀʟɪᴅ @ᴜsᴇʀɴᴀᴍᴇ/ɪᴅ.")
+            return
+        if target_id == context.bot.id:
+            await safe_reply(update, "❌ ɪ ᴄᴀɴ'ᴛ ᴀᴘᴘʀᴏᴠᴇ ᴍʏsᴇʟғ.")
             return
         if command == "approve":
             STORE.db.execute("INSERT OR REPLACE INTO approvals(chat_id,user_id,approved_at) VALUES(?,?,?)", (chat.id, target_id, now()))
         else:
-            STORE.db.execute("DELETE FROM approvals WHERE chat_id=? AND user_id=?", (chat.id, target_id))
+            result = STORE.db.execute(
+                "DELETE FROM approvals WHERE chat_id=? AND user_id=?",
+                (chat.id, target_id),
+            )
+            if not result.rowcount:
+                await safe_reply(update, f"ℹ️ {esc(target['name'])} ᴡᴀs ɴᴏᴛ ᴀᴘᴘʀᴏᴠᴇᴅ.")
+                return
         STORE.db.commit()
         await safe_reply(update, f"✅ {command}ᴅ {esc(target['name'])}.")
         return
@@ -2256,35 +2600,75 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if command == "logchannel":
         if arg in {"off", "none", "0"}:
             settings["log_channel"] = 0
+            settings["log_enabled"] = False
             modcfg.save_settings(STORE, chat.id, settings)
             await safe_reply(update, "✅ ʟᴏɢ ᴄʜᴀɴɴᴇʟ ʀᴇᴍᴏᴠᴇᴅ.")
             return
         if not value:
             current = settings.get("log_channel") or "ɴᴏᴛ sᴇᴛ"
-            await safe_reply(update, f"📊 ʟᴏɢ ᴄʜᴀɴɴᴇʟ: <code>{current}</code>\nᴜsᴇ /logchannel -100... ᴏʀ @channel")
+            state = "ᴏɴ" if settings.get("log_enabled", True) else "ᴏғғ"
+            await safe_reply(
+                update,
+                f"📊 ʟᴏɢ ᴄʜᴀɴɴᴇʟ: <code>{current}</code>\n"
+                f"📨 ʟᴏɢs: <b>{state}</b>\n"
+                "ᴜsᴇ /logchannel -100... ᴏʀ @channel",
+            )
             return
         try:
-            channel = int(value)
-        except ValueError:
-            try:
-                channel = (await context.bot.get_chat(value)).id
-            except TelegramError:
-                await safe_reply(update, "❌ ɪɴᴠᴀʟɪᴅ ᴄʜᴀɴɴᴇʟ.")
-                return
-        settings["log_channel"] = channel
+            channel_ref = int(value) if value.lstrip("-").isdigit() else value
+            channel_chat = await context.bot.get_chat(channel_ref)
+        except (TelegramError, ValueError):
+            await safe_reply(update, "❌ ɪɴᴠᴀʟɪᴅ ᴄʜᴀɴɴᴇʟ ᴏʀ ɪ ᴄᴀɴ'ᴛ ᴀᴄᴄᴇss ɪᴛ.")
+            return
+        if channel_chat.type != ChatType.CHANNEL:
+            await safe_reply(update, "❌ ᴛʜᴇ ʟᴏɢ ᴛᴀʀɢᴇᴛ ᴍᴜsᴛ ʙᴇ ᴀ ᴄʜᴀɴɴᴇʟ.")
+            return
+        try:
+            bot_member = await context.bot.get_chat_member(
+                channel_chat.id, context.bot.id
+            )
+        except TelegramError:
+            await safe_reply(update, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴄʜᴇᴄᴋ ᴍʏ ʀɪɢʜᴛs ɪɴ ᴛʜᴀᴛ ᴄʜᴀɴɴᴇʟ.")
+            return
+        can_post = bot_member.status == ChatMemberStatus.OWNER or (
+            bot_member.status == ChatMemberStatus.ADMINISTRATOR
+            and bool(getattr(bot_member, "can_post_messages", False))
+        )
+        if not can_post:
+            await safe_reply(
+                update,
+                "❌ ᴍᴀᴋᴇ ᴢᴀʀᴀ ᴀɴ ᴀᴅᴍɪɴ ɪɴ ᴛʜᴀᴛ ᴄʜᴀɴɴᴇʟ ᴡɪᴛʜ ᴘᴏsᴛ ᴘᴇʀᴍɪssɪᴏɴ.",
+            )
+            return
+        try:
+            await context.bot.send_message(
+                channel_chat.id,
+                "🛡️ <b>ᴢᴀʀᴀ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ ʟᴏɢs ᴄᴏɴɴᴇᴄᴛᴇᴅ.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            await safe_reply(update, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ sᴇɴᴅ ᴀ ᴛᴇsᴛ ᴍᴇssᴀɢᴇ ᴛᴏ ᴛʜᴀᴛ ᴄʜᴀɴɴᴇʟ.")
+            return
+        settings["log_channel"] = channel_chat.id
+        settings["log_enabled"] = True
         modcfg.save_settings(STORE, chat.id, settings)
-        await safe_reply(update, f"✅ ʟᴏɢ ᴄʜᴀɴɴᴇʟ sᴇᴛ ᴛᴏ <code>{channel}</code>.")
+        await safe_reply(update, f"✅ ʟᴏɢ ᴄʜᴀɴɴᴇʟ sᴇᴛ ᴛᴏ <code>{channel_chat.id}</code>.")
         return
     if command == "setlog":
         if not settings.get("log_channel"):
             await safe_reply(update, "sᴇᴛ ᴀ ʟᴏɢ ᴄʜᴀɴɴᴇʟ ғɪʀsᴛ: /logchannel @channel")
             return
+        settings["log_enabled"] = True
+        modcfg.save_settings(STORE, chat.id, settings)
         await safe_reply(update, "✅ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ ʟᴏɢs ᴀʀᴇ ᴇɴᴀʙʟᴇᴅ.")
         return
     if command == "unsetlog":
-        settings["log_channel"] = 0
+        settings["log_enabled"] = False
         modcfg.save_settings(STORE, chat.id, settings)
-        await safe_reply(update, "✅ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ ʟᴏɢs ᴀʀᴇ ᴅɪsᴀʙʟᴇᴅ.")
+        await safe_reply(
+            update,
+            "✅ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ ʟᴏɢs ᴀʀᴇ ᴅɪsᴀʙʟᴇᴅ. ᴛʜᴇ ᴄʜᴀɴɴᴇʟ ɪs ᴋᴇᴘᴛ; ᴜsᴇ /setlog ᴛᴏ ʀᴇ-ᴇɴᴀʙʟᴇ.",
+        )
         return
 
 
@@ -2311,18 +2695,68 @@ async def relationship_report(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    command = (update.effective_message.text or "").split()[0].lstrip("/").lower()
+    command = (
+        (update.effective_message.text or "")
+        .split()[0]
+        .lstrip("/")
+        .split("@", 1)[0]
+        .lower()
+    )
     if command in {"items", "item"}:
         rows = STORE.db.execute("SELECT item,quantity FROM items WHERE user_id=? AND quantity>0", (update.effective_user.id,)).fetchall()
         await safe_reply(update, "🎒 <b>ɪᴛᴇᴍs</b>\n" + ("\n".join(f"• {esc(r['item'])}: {r['quantity']}" for r in rows) or "ɴᴏ ɪᴛᴇᴍs ʏᴇᴛ."))
         return
     if command == "gift":
         target_id, target = await target_user(update, context.args)
-        if target:
-            item = context.args[-1] if context.args else "rose"
-            STORE.db.execute("INSERT INTO items(user_id,item,quantity) VALUES(?,?,1) ON CONFLICT(user_id,item) DO UPDATE SET quantity=quantity+1", (target_id, item))
-            STORE.db.commit()
-            await safe_reply(update, f"🎁 {mention(update.effective_user)} ɢɪғᴛᴇᴅ ᴀ {esc(item)} ᴛᴏ {esc(target['name'])}.")
+        if not target:
+            await safe_reply(update, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ ᴏʀ ᴜsᴇ ᴛʜᴇɪʀ @ᴜsᴇʀɴᴀᴍᴇ/ɪᴅ.")
+            return
+        if target_id == update.effective_user.id:
+            await safe_reply(update, "❌ ʏᴏᴜ ᴄᴀɴ'ᴛ ɢɪғᴛ ᴀɴ ɪᴛᴇᴍ ᴛᴏ ʏᴏᴜʀsᴇʟғ.")
+            return
+        item_args = list(context.args)
+        if update.effective_message and update.effective_message.reply_to_message:
+            item = item_args[-1].strip().lower() if item_args else ""
+        else:
+            target_ref = next(
+                (value for value in item_args if value.startswith("@")), None
+            )
+            if target_ref is None:
+                numeric = [value for value in item_args if value.strip().isdigit()]
+                target_ref = numeric[-1] if numeric else None
+            item = next(
+                (
+                    value.strip().lower()
+                    for value in item_args
+                    if value != target_ref and not value.startswith("@")
+                ),
+                "",
+            )
+        if not item:
+            await safe_reply(update, "ᴜsᴇ /gift @user ɪᴛᴇᴍ ᴏʀ ʀᴇᴘʟʏ ᴡɪᴛʜ /gift ɪᴛᴇᴍ.")
+            return
+        with STORE.transaction():
+            owned = STORE.db.execute(
+                "SELECT quantity FROM items WHERE user_id=? AND lower(item)=?",
+                (update.effective_user.id, item),
+            ).fetchone()
+            if not owned or int(owned["quantity"]) < 1:
+                await safe_reply(update, f"❌ ʏᴏᴜ ᴅᴏɴ'ᴛ ᴏᴡɴ <code>{esc(item)}</code>.")
+                return
+            STORE.db.execute(
+                "UPDATE items SET quantity=quantity-1 WHERE user_id=? AND lower(item)=?",
+                (update.effective_user.id, item),
+            )
+            STORE.db.execute(
+                "DELETE FROM items WHERE user_id=? AND lower(item)=? AND quantity<=0",
+                (update.effective_user.id, item),
+            )
+            STORE.db.execute(
+                "INSERT INTO items(user_id,item,quantity) VALUES(?,?,1) "
+                "ON CONFLICT(user_id,item) DO UPDATE SET quantity=quantity+1",
+                (target_id, item),
+            )
+        await safe_reply(update, f"🎁 {mention(update.effective_user)} ɢɪғᴛᴇᴅ ᴀ {esc(item)} ᴛᴏ {esc(target['name'])}.")
         return
     if command in {"rank", "pfp", "detail"}:
         _, row = await target_user(update, context.args)
@@ -2351,7 +2785,13 @@ async def pfp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def utility_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    command = (update.effective_message.text or "").split()[0].lstrip("/").lower()
+    command = (
+        (update.effective_message.text or "")
+        .split()[0]
+        .lstrip("/")
+        .split("@", 1)[0]
+        .lower()
+    )
     if command == "setemoji":
         emoji = (update.effective_message.text or "").partition(" ")[2].strip() or "💗"
         STORE.db.execute("INSERT OR REPLACE INTO user_settings(user_id,emoji) VALUES(?,?)", (update.effective_user.id, emoji))
@@ -2706,27 +3146,28 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=verification_markup(),
             )
             return
-        try:
-            member = await context.bot.get_chat_member(
-                UPDATE_CHANNEL_CHAT_ID, update.effective_user.id
-            )
-            joined = member.status in {
-                ChatMemberStatus.MEMBER,
-                ChatMemberStatus.ADMINISTRATOR,
-                ChatMemberStatus.OWNER,
-            }
-        except TelegramError:
-            await safe_reply(
-                update,
-                "⚠️ ᴠᴇʀɪғɪᴄᴀᴛɪᴏɴ ɪs ᴛᴇᴍᴘᴏʀᴀʀɪʟʏ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ. ᴛʀʏ /daily ᴀɢᴀɪɴ ʟᴀᴛᴇʀ.",
-            )
-            return
-        if not joined:
-            await safe_reply(
-                update,
-                f"🔒 ᴠᴇʀɪғʏ ʏᴏᴜʀsᴇʟғ ғɪʀsᴛ: ᴊᴏɪɴ {UPDATE_CHANNEL_URL} ᴛʜᴇɴ ᴜsᴇ /verify ᴀɴᴅ /daily.",
-            )
-            return
+        if UPDATE_CHANNEL_CHAT_ID:
+            try:
+                member = await context.bot.get_chat_member(
+                    UPDATE_CHANNEL_CHAT_ID, update.effective_user.id
+                )
+                joined = member.status in {
+                    ChatMemberStatus.MEMBER,
+                    ChatMemberStatus.ADMINISTRATOR,
+                    ChatMemberStatus.OWNER,
+                }
+            except TelegramError:
+                await safe_reply(
+                    update,
+                    "⚠️ ᴠᴇʀɪғɪᴄᴀᴛɪᴏɴ ɪs ᴛᴇᴍᴘᴏʀᴀʀɪʟʏ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ. ᴛʀʏ /daily ᴀɢᴀɪɴ ʟᴀᴛᴇʀ.",
+                )
+                return
+            if not joined:
+                await safe_reply(
+                    update,
+                    f"🔒 ᴠᴇʀɪғʏ ʏᴏᴜʀsᴇʟғ ғɪʀsᴛ: ᴊᴏɪɴ {UPDATE_CHANNEL_URL} ᴛʜᴇɴ ᴜsᴇ /verify ᴀɴᴅ /daily.",
+                )
+                return
     reward = 2000
     claimed = STORE.claim_daily(update.effective_user.id, reward)
     if claimed is None:
@@ -2793,7 +3234,6 @@ async def give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update.effective_user.id,
             target_id,
             amount,
-            sender_is_staff=staff(update.effective_user.id),
         )
     except InsufficientBalanceError:
         await safe_reply(update, "❌ ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ ᴍᴏɴᴇʏ.")
@@ -2843,6 +3283,12 @@ async def kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if invincible(target_id):
         await safe_reply(update, f"🛡️ {esc(target['name'])} ɪs ᴀɴ ᴏᴡɴᴇʀ/ᴀᴅᴍɪɴ — ᴛʜᴇʏ ᴀʀᴇ ɪɴᴠɪɴᴄɪʙʟᴇ!")
         return
+    if target["dead"]:
+        await safe_reply(update, f"💀 {esc(target['name'])} ɪs ᴀʟʀᴇᴀᴅʏ ᴅᴇᴀᴅ. ᴜsᴇ /revive ғɪʀsᴛ.")
+        return
+    if target["protection_until"] > now():
+        await safe_reply(update, f"🛡️ {esc(target['name'])} ɪs ᴘʀᴏᴛᴇᴄᴛᴇᴅ ғᴏʀ {protection_text(target, target_id)}.")
+        return
     STORE.kill(target_id, update.effective_user.id)
     await safe_reply(update, f"⚔️ {mention(update.effective_user)} ᴅᴇғᴇᴀᴛᴇᴅ {esc(target['name'])}. /revive ᴄᴀɴ ʙʀɪɴɢ ᴛʜᴇᴍ ʙᴀᴄᴋ.")
 
@@ -2851,6 +3297,9 @@ async def revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_id, target = await target_user(update, context.args)
     if not target:
         await safe_reply(update, "ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴅᴇᴀᴅ ᴜsᴇʀ.")
+        return
+    if not target["dead"]:
+        await safe_reply(update, f"ℹ️ {esc(target['name'])} ɪs ᴀʟʀᴇᴀᴅʏ ᴀʟɪᴠᴇ.")
         return
     cost = 0 if staff(update.effective_user.id) else 50
     sender = STORE.user(update.effective_user)
@@ -2932,19 +3381,31 @@ async def quick_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def roulette(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP} and not games_are_open(chat.id):
+        await safe_reply(update, "🔒 ɢᴀᴍᴇs ᴀʀᴇ ᴄʟᴏsᴇᴅ ɪɴ ᴛʜɪs ɢʀᴏᴜᴘ.")
+        return
     amount = number_arg(update, 0)
     result = random.randint(0, 36)
-    red = result in {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
-    win = amount > 0 and result % 2 == 0
+    parity = "ᴇᴠᴇɴ" if result % 2 == 0 else "ᴏᴅᴅ"
+    win = amount > 0 and result % 2 == 0 and result != 0
     if amount > 0 and not staff(update.effective_user.id):
         if not STORE.settle_roulette(update.effective_user.id, amount, win, False):
             await safe_reply(update, "❌ ɪɴsᴜғғɪᴄɪᴇɴᴛ ʙᴀʟᴀɴᴄᴇ.")
             return
-    await safe_reply(update, f"🎰 ʀᴏᴜʟᴇᴛᴛᴇ: <b>{result}</b> {'🔴' if red else '⚫'}\n" + ("🎉 ʏᴏᴜ ᴡᴏɴ!" if win else "ᴛʀʏ ᴀɢᴀɪɴ — ᴘʟᴀʏ ʀᴇsᴘᴏɴsɪʙʟʏ."))
+    await safe_reply(
+        update,
+        f"🎰 ʀᴏᴜʟᴇᴛᴛᴇ: <b>{result}</b> ({parity})\n"
+        + ("🎉 ʏᴏᴜ ᴡᴏɴ!" if win else "ᴛʀʏ ᴀɢᴀɪɴ — ᴘʟᴀʏ ʀᴇsᴘᴏɴsɪʙʟʏ."),
+    )
 
 
 async def bomb_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+    if chat.type in {ChatType.GROUP, ChatType.SUPERGROUP} and not games_are_open(chat.id):
+        await safe_reply(update, "🔒 ɢᴀᴍᴇs ᴀʀᴇ ᴄʟᴏsᴇᴅ ɪɴ ᴛʜɪs ɢʀᴏᴜᴘ.")
+        return
+    chat_id = chat.id
     with STORE.transaction():
         state = STORE.bomb_game(chat_id) or {"players": [], "turn": 0, "bomb": None}
         if not state["players"]:
@@ -2957,7 +3418,11 @@ async def bomb_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def bomb_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+    if chat.type in {ChatType.GROUP, ChatType.SUPERGROUP} and not games_are_open(chat.id):
+        await safe_reply(update, "🔒 ɢᴀᴍᴇs ᴀʀᴇ ᴄʟᴏsᴇᴅ ɪɴ ᴛʜɪs ɢʀᴏᴜᴘ.")
+        return
+    chat_id = chat.id
     with STORE.transaction():
         state = STORE.bomb_game(chat_id) or {
             "players": [],
@@ -3001,7 +3466,13 @@ async def owner_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not owner(update.effective_user.id):
         await safe_reply(update, "❌ ᴏɴʟʏ ᴛʜᴇ ᴏᴡɴᴇʀ ᴄᴀɴ ᴜsᴇ ᴛʜɪs.")
         return
-    command = (update.effective_message.text or "").split()[0].lstrip("/").lower()
+    command = (
+        (update.effective_message.text or "")
+        .split()[0]
+        .lstrip("/")
+        .split("@", 1)[0]
+        .lower()
+    )
     raw_args = list(context.args)
     target_args = raw_args
     amount = 0
@@ -3018,9 +3489,15 @@ async def owner_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update, "ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ ᴏʀ ᴜsᴇ ᴛʜᴇɪʀ ɪᴅ/@ᴜsᴇʀɴᴀᴍᴇ.")
         return
     if "addmoney" in command:
+        if amount <= 0:
+            await safe_reply(update, "ᴜsᴇ /maddmoney @user 500 ᴏʀ ʀᴇᴘʟʏ ᴡɪᴛʜ /maddmoney 500.")
+            return
         STORE.grant(target_id, coins=amount)
         await safe_reply(update, f"✅ ᴀᴅᴅᴇᴅ ${amount:,} ᴛᴏ {esc(target['name'])}.")
     elif "addgems" in command:
+        if amount <= 0:
+            await safe_reply(update, "ᴜsᴇ /maddgems @user 10 ᴏʀ ʀᴇᴘʟʏ ᴡɪᴛʜ /maddgems 10.")
+            return
         STORE.grant(target_id, gems=amount)
         await safe_reply(update, f"✅ ᴀᴅᴅᴇᴅ {amount:,} ɢᴇᴍs ᴛᴏ {esc(target['name'])}.")
     elif "premium" in command:
@@ -3029,14 +3506,14 @@ async def owner_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def owner_center(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not staff(update.effective_user.id):
+    if not owner(update.effective_user.id):
         await safe_reply(update, "❌ ᴛʜɪs ᴄᴏᴍᴍᴀɴᴅ ɪs ʜɪᴅᴅᴇɴ.")
         return
     await safe_reply(update, OWNER_PAGE, reply_markup=category_keyboard())
 
 
 async def owner_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not staff(update.effective_user.id):
+    if not owner(update.effective_user.id):
         return
     users = STORE.db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
     chats = STORE.db.execute("SELECT COUNT(*) AS n FROM chats").fetchone()["n"]
@@ -3638,9 +4115,9 @@ async def card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     player["cards"] = [random.randint(1, 9) for _ in range(5)]
                     player["used"] = []
                     player["choice"] = None
-                    if not staff(int(player_id)) and not STORE.debit(
-                        int(player_id), state["bet"]
-                    ):
+                    if staff(int(player_id)):
+                        continue
+                    if not STORE.debit(int(player_id), state["bet"]):
                         raise InsufficientBalanceError(
                             "player balance changed while starting the card game"
                         )
@@ -3789,7 +4266,7 @@ async def hack_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_reply(update, "❌ ʀᴇᴡᴀʀᴅ ᴍᴜsᴛ ʙᴇ ᴘᴏsɪᴛɪᴠᴇ ᴀɴᴅ ᴘᴀssᴡᴏʀᴅ ʟᴇɴɢᴛʜ ᴍᴜsᴛ ʙᴇ 3–6.")
         return
     host = STORE.user(update.effective_user)
-    if not staff(update.effective_user.id) and int(host["balance"]) < reward:
+    if int(host["balance"]) < reward:
         await safe_reply(update, f"❌ ʏᴏᴜ ɴᴇᴇᴅ ${reward:,} ᴛᴏ ʜᴏsᴛ ᴛʜɪs ɢᴀᴍᴇ.")
         return
     password = "".join(random.sample("0123456789", length))
@@ -3803,9 +4280,7 @@ async def hack_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "entries": [],
     }
     with STORE.transaction():
-        funded = staff(update.effective_user.id) or STORE.debit(
-            update.effective_user.id, reward
-        )
+        funded = STORE.debit(update.effective_user.id, reward)
         if funded:
             STORE.save_hack_game(chat_id, state)
     if not funded:
@@ -3950,8 +4425,7 @@ async def hack_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             ended = True
             state = latest
-            if not staff(int(state["host_id"])):
-                STORE.add_money(int(state["host_id"]), int(state["reward"]))
+            STORE.add_money(int(state["host_id"]), int(state["reward"]))
             for player_id, entry in state.get("players", {}).items():
                 if not staff(int(player_id)):
                     if entry["currency"] == "gems":
@@ -3979,6 +4453,13 @@ async def close_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     buttons = verification_markup()
+    if not UPDATE_CHANNEL_CHAT_ID:
+        STORE.update(update.effective_user.id, verified_at=now())
+        await safe_reply(
+            update,
+            "✅ ᴠᴇʀɪғɪᴄᴀᴛɪᴏɴ ɪs ɴᴏᴛ ʀᴇǫᴜɪʀᴇᴅ ʀɪɢʜᴛ ɴᴏᴡ. 🎁 ᴜsᴇ /daily ᴛᴏ ᴄʟᴀɪᴍ 2,000 ᴄᴏɪɴs.",
+        )
+        return
     try:
         member = await context.bot.get_chat_member(
             UPDATE_CHANNEL_CHAT_ID, update.effective_user.id
@@ -4002,15 +4483,15 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=buttons,
         )
         return
+    STORE.update(update.effective_user.id, verified_at=now())
     if VERIFY_WEBAPP_URL:
         await safe_reply(
             update,
-            "✅ ᴄʜᴀɴɴᴇʟ ᴍᴇᴍʙᴇʀsʜɪᴘ ᴄᴏɴғɪʀᴍᴇᴅ.\n"
-            "🔐 ᴛᴀᴘ <b>Open verification</b> ᴛᴏ ғɪɴɪsʜ ᴛʜᴇ ᴄᴜsᴛᴏᴍ ᴠᴇʀɪғɪᴄᴀᴛɪᴏɴ.",
+            "✅ ᴄʜᴀɴɴᴇʟ ᴍᴇᴍʙᴇʀsʜɪᴘ ᴄᴏɴғɪʀᴍᴇᴅ ᴀɴᴅ ᴠᴇʀɪғɪᴇᴅ.\n"
+            "🎁 ᴜsᴇ /daily ᴛᴏ ᴄʟᴀɪᴍ 2,000 ᴄᴏɪɴs.",
             reply_markup=buttons,
         )
         return
-    STORE.update(update.effective_user.id, verified_at=now())
     await safe_reply(
         update,
         "✅ ᴄʜᴀɴɴᴇʟ ᴠᴇʀɪғɪᴇᴅ!\n🎁 ᴜsᴇ /daily ᴛᴏ ᴄʟᴀɪᴍ 2,000 ᴄᴏɪɴs.",
@@ -4041,18 +4522,21 @@ async def web_app_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "❌ ᴠᴇʀɪғɪᴄᴀᴛɪᴏɴ ᴄᴏᴜʟᴅ ɴᴏᴛ ʙᴇ ᴛʀᴜsᴛᴇᴅ. ᴏᴘᴇɴ ᴛʜᴇ ᴍɪɴɪ ᴀᴘᴘ ғʀᴏᴍ ᴛʜᴇ ᴢᴀʀᴀ ʙᴏᴛ ᴀɢᴀɪɴ.",
         )
         return
-    try:
-        member = await context.bot.get_chat_member(
-            UPDATE_CHANNEL_CHAT_ID, update.effective_user.id
-        )
-        joined = member.status in {
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        }
-    except TelegramError:
-        await safe_reply(update, "⚠️ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴄʜᴇᴄᴋ ᴛʜᴇ ᴄʜᴀɴɴᴇʟ. ᴛʀʏ ᴀɢᴀɪɴ.")
-        return
+    if not UPDATE_CHANNEL_CHAT_ID:
+        joined = True
+    else:
+        try:
+            member = await context.bot.get_chat_member(
+                UPDATE_CHANNEL_CHAT_ID, update.effective_user.id
+            )
+            joined = member.status in {
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            }
+        except TelegramError:
+            await safe_reply(update, "⚠️ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴄʜᴇᴄᴋ ᴛʜᴇ ᴄʜᴀɴɴᴇʟ. ᴛʀʏ ᴀɢᴀɪɴ.")
+            return
     await safe_reply(
         update,
         "✅ ᴠᴇʀɪғɪᴇᴅ! ᴜsᴇ /daily ᴛᴏ ᴄʟᴀɪᴍ 2,000 ᴄᴏɪɴs."
@@ -4060,96 +4544,300 @@ async def web_app_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else f"❌ ᴘʟᴇᴀsᴇ ᴊᴏɪɴ {UPDATE_CHANNEL_URL} ғɪʀsᴛ, ᴛʜᴇɴ ᴛᴀᴘ ᴠᴇʀɪғʏ ᴀɢᴀɪɴ.",
     )
     if joined:
+        STORE.user(update.effective_user)
         STORE.update(update.effective_user.id, verified_at=now())
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id, row = await target_user(update, context.args)
+    if user_id <= 0:
+        await safe_reply(update, "❌ ᴜsᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ. ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇɪʀ ᴍᴇssᴀɢᴇ ᴏʀ ᴜsᴇ ᴀ ᴋɴᴏᴡɴ @ᴜsᴇʀɴᴀᴍᴇ.")
+        return
     await safe_reply(update, f"🪪 ɪᴅ: <code>{user_id}</code>\n👤 ɴᴀᴍᴇ: {esc(row['name'] if row else str(user_id))}")
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or update.effective_chat.type == ChatType.PRIVATE:
+    chat = update.effective_chat
+    if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return
-    if not staff(update.effective_user.id):
+    if not await is_group_admin(update, context):
+        await safe_reply(update, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.")
+        return
+    message = update.effective_message
+    command = (
+        (message.text or "").split()[0].lstrip("/").split("@", 1)[0].lower()
+        if message and message.text
+        else ""
+    )
+    args = list(context.args)
+    reply = message.reply_to_message if message else None
+
+    if command == "admins":
         try:
-            member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-            if member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
-                await safe_reply(update, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.")
-                return
+            admins = await chat.get_administrators()
+            await safe_reply(
+                update,
+                "🛡️ <b>ᴀᴅᴍɪɴs</b>\n"
+                + "\n".join(f"• {mention(admin.user)}" for admin in admins),
+            )
         except TelegramError:
-            return
-    command = (update.effective_message.text or "").split()[0].lstrip("/").lower()
-    target_id, target = await target_user(update, context.args)
-    if command in {"admins"}:
-        admins = await update.effective_chat.get_administrators()
-        await safe_reply(update, "🛡️ <b>ᴀᴅᴍɪɴs</b>\n" + "\n".join(f"• {mention(a.user)}" for a in admins))
+            await safe_reply(update, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ʟᴏᴀᴅ ᴛʜᴇ ᴀᴅᴍɪɴ ʟɪsᴛ.")
         return
+
     if command in {"purge", "del"}:
-        if update.effective_message.reply_to_message:
-            await update.effective_message.reply_to_message.delete()
-        await update.effective_message.delete()
+        allowed, error = await bot_admin_check(context, chat, "can_delete_messages")
+        if not allowed:
+            await safe_reply(update, error)
+            return
+        if not reply:
+            await safe_reply(update, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴍᴇssᴀɢᴇ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ᴅᴇʟᴇᴛᴇ.")
+            return
+        try:
+            if command == "del":
+                await reply.delete()
+                await message.delete()
+            else:
+                start = min(reply.message_id, message.message_id)
+                end = max(reply.message_id, message.message_id)
+                if end - start > 1000:
+                    await safe_reply(update, "❌ ᴛʜᴀᴛ ʀᴀɴɢᴇ ɪs ᴛᴏᴏ ʟᴀʀɢᴇ. ʀᴇᴘʟʏ ᴛᴏ ᴀ ɴᴇᴀʀᴇʀ ᴍᴇssᴀɢᴇ.")
+                    return
+                message_ids = list(range(start, end + 1))
+                for offset in range(0, len(message_ids), 100):
+                    chunk = message_ids[offset : offset + 100]
+                    try:
+                        await context.bot.delete_messages(chat.id, chunk)
+                    except TelegramError:
+                        for message_id in chunk:
+                            try:
+                                await context.bot.delete_message(chat.id, message_id)
+                            except TelegramError:
+                                pass
+        except TelegramError:
+            await safe_reply(update, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴅᴇʟᴇᴛᴇ ᴛʜᴏsᴇ ᴍᴇssᴀɢᴇs.")
         return
-    if not target:
-        await safe_reply(update, "ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ ғɪʀsᴛ.")
+
+    if command == "pin":
+        allowed, error = await bot_admin_check(context, chat, "can_pin_messages")
+        if not allowed:
+            await safe_reply(update, error)
+            return
+        if not reply:
+            await safe_reply(update, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴍᴇssᴀɢᴇ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ᴘɪɴ.")
+            return
+        try:
+            await reply.pin()
+            await safe_reply(update, f"📌 ᴘɪɴɴᴇᴅ ᴍᴇssᴀɢᴇ <code>{reply.message_id}</code>.")
+        except TelegramError as exc:
+            log.warning("Pin failed: %s", type(exc).__name__)
+            await safe_reply(update, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴘɪɴ ᴛʜᴀᴛ ᴍᴇssᴀɢᴇ.")
         return
+
+    if command == "unpin":
+        allowed, error = await bot_admin_check(context, chat, "can_pin_messages")
+        if not allowed:
+            await safe_reply(update, error)
+            return
+        try:
+            if reply:
+                await context.bot.unpin_chat_message(chat.id, message_id=reply.message_id)
+                await safe_reply(update, f"📌 ᴜɴᴘɪɴɴᴇᴅ ᴍᴇssᴀɢᴇ <code>{reply.message_id}</code>.")
+            else:
+                await context.bot.unpin_chat_message(chat.id)
+                await safe_reply(update, "📌 ᴜɴᴘɪɴɴᴇᴅ ᴛʜᴇ ʟᴀᴛᴇsᴛ ᴘɪɴɴᴇᴅ ᴍᴇssᴀɢᴇ.")
+        except TelegramError:
+            await safe_reply(update, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴜɴᴘɪɴ ᴛʜᴀᴛ ᴍᴇssᴀɢᴇ.")
+        return
+
+    if command in {"lock", "unlock"}:
+        allowed, error = await bot_admin_check(context, chat, "can_restrict_members")
+        if not allowed:
+            await safe_reply(update, error)
+            return
+        try:
+            permissions = (
+                locked_permissions() if command == "lock" else chat_default_permissions(chat)
+            )
+            await context.bot.set_chat_permissions(chat.id, permissions)
+            await safe_reply(
+                update,
+                "🔒 ɢʀᴏᴜᴘ ʟᴏᴄᴋᴇᴅ." if command == "lock" else "🔓 ɢʀᴏᴜᴘ ᴜɴʟᴏᴄᴋᴇᴅ.",
+            )
+        except TelegramError:
+            await safe_reply(update, "❌ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴄʜᴀɴɢᴇ ᴛʜᴇ ɢʀᴏᴜᴘ ᴘᴇʀᴍɪssɪᴏɴs.")
+        return
+
+    duration: int | None = None
+    target_args = args
+    if command in {"tban", "tmute"}:
+        duration, target_args, duration_error = split_duration_args(args, bool(reply))
+        if duration_error:
+            await safe_reply(update, duration_error)
+            return
+
+    if not reply and not target_args:
+        await safe_reply(update, "❌ ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ ᴏʀ ᴜsᴇ ᴛʜᴇɪʀ @ᴜsᴇʀɴᴀᴍᴇ/ɪᴅ.")
+        return
+    target_id, target = await target_user(update, target_args, allow_synthetic=True)
+    if target_id <= 0 or not target:
+        await safe_reply(update, "❌ ᴜsᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ. ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇɪʀ ᴍᴇssᴀɢᴇ ᴏʀ ᴜsᴇ ᴀ ᴠᴀʟɪᴅ @ᴜsᴇʀɴᴀᴍᴇ/ɪᴅ.")
+        return
+
+    member, target_error = await validate_moderation_target(
+        context, chat, target_id, command, update.effective_user.id
+    )
+    if not member:
+        await safe_reply(update, target_error)
+        return
+    status = member.status
+    target_name = getattr(getattr(member, "user", None), "full_name", None) or target["name"]
+
+    if command in {"ban", "tban", "kick", "mute", "tmute"} and status == ChatMemberStatus.BANNED:
+        await safe_reply(update, f"ℹ️ {esc(target_name)} ɪs ᴀʟʀᴇᴀᴅʏ ʙᴀɴɴᴇᴅ.")
+        return
+    if command == "promote" and status == ChatMemberStatus.BANNED:
+        await safe_reply(update, f"ℹ️ ᴜɴʙᴀɴ {esc(target_name)} ʙᴇғᴏʀᴇ ᴘʀᴏᴍᴏᴛɪɴɢ ᴛʜᴇᴍ.")
+        return
+    if command in {"ban", "tban", "kick", "mute", "tmute", "warn", "promote"} and status == ChatMemberStatus.LEFT:
+        await safe_reply(update, f"ℹ️ {esc(target_name)} ɪs ɴᴏᴛ ɪɴ ᴛʜɪs ɢʀᴏᴜᴘ.")
+        return
+    if command in {"mute", "tmute"} and status == ChatMemberStatus.RESTRICTED and not getattr(member, "can_send_messages", True):
+        await safe_reply(update, f"ℹ️ {esc(target_name)} ɪs ᴀʟʀᴇᴀᴅʏ ᴍᴜᴛᴇᴅ.")
+        return
+    if command == "unban" and status != ChatMemberStatus.BANNED:
+        await safe_reply(update, f"ℹ️ {esc(target_name)} ɪs ɴᴏᴛ ʙᴀɴɴᴇᴅ.")
+        return
+    if command == "unmute" and (
+        status != ChatMemberStatus.RESTRICTED
+        or bool(getattr(member, "can_send_messages", True))
+    ):
+        await safe_reply(update, f"ℹ️ {esc(target_name)} ɪs ɴᴏᴛ ᴍᴜᴛᴇᴅ.")
+        return
+    if command == "demote" and status != ChatMemberStatus.ADMINISTRATOR:
+        await safe_reply(update, f"ℹ️ {esc(target_name)} ɪs ɴᴏᴛ ᴀ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴ.")
+        return
+
+    permission = None
+    if command in {"ban", "tban", "unban", "kick", "mute", "tmute", "unmute"}:
+        permission = "can_restrict_members"
+    elif command in {"promote", "demote"}:
+        permission = "can_promote_members"
+    if permission:
+        allowed, error = await bot_admin_check(context, chat, permission)
+        if not allowed:
+            await safe_reply(update, error)
+            return
+
+    if command == "warn":
+        with STORE.transaction():
+            STORE.db.execute(
+                "INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,1) "
+                "ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1",
+                (chat.id, target_id),
+            )
+            warning = STORE.db.execute(
+                "SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
+                (chat.id, target_id),
+            ).fetchone()
+        chat_row = STORE.chat(chat.id, chat.title or "")
+        settings = modcfg.load_settings(chat_row)
+        limit = int(settings.get("warn_limit", 3))
+        count = int(warning["count"])
+        if count < limit:
+            await safe_reply(
+                update,
+                f"⚠️ ᴡᴀʀɴᴇᴅ {esc(target_name)}. ᴡᴀʀɴɪɴɢs: <b>{count}/{limit}</b>.",
+            )
+            return
+        action = str(settings.get("warn_action", "mute"))
+        if action not in {"mute", "kick", "ban"}:
+            action = "mute"
+        allowed, error = await bot_admin_check(context, chat, "can_restrict_members")
+        if not allowed:
+            await safe_reply(
+                update,
+                f"⚠️ ᴡᴀʀɴɪɴɢ ʀᴇᴄᴏʀᴅᴇᴅ ({count}/{limit}), ʙᴜᴛ ᴛʜᴇ {action} ᴀᴄᴛɪᴏɴ ᴄᴏᴜʟᴅ ɴᴏᴛ ʀᴜɴ: {error}",
+            )
+            return
+        try:
+            if action == "ban":
+                await context.bot.ban_chat_member(chat.id, target_id)
+            elif action == "kick":
+                await context.bot.ban_chat_member(chat.id, target_id)
+                try:
+                    await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
+                except TelegramError:
+                    await safe_reply(
+                        update,
+                        f"⚠️ {esc(target_name)} ᴡᴀs ʙᴀɴɴᴇᴅ, ʙᴜᴛ ᴛʜᴇ ᴋɪᴄᴋ ᴜɴʙᴀɴ ғᴀɪʟᴇᴅ. ᴜsᴇ /unban {target_id}.",
+                    )
+                    return
+            else:
+                await context.bot.restrict_chat_member(
+                    chat.id,
+                    target_id,
+                    ChatPermissions(can_send_messages=False),
+                    until_date=now() + 600,
+                )
+        except TelegramError as exc:
+            log.warning("Warning action failed: %s", type(exc).__name__)
+            await safe_reply(
+                update,
+                f"⚠️ ᴡᴀʀɴɪɴɢ ʀᴇᴄᴏʀᴅᴇᴅ ({count}/{limit}), ʙᴜᴛ ᴛʜᴇ {action} ᴀᴄᴛɪᴏɴ ғᴀɪʟᴇᴅ.",
+            )
+            return
+        STORE.db.execute(
+            "DELETE FROM warnings WHERE chat_id=? AND user_id=?",
+            (chat.id, target_id),
+        )
+        STORE.db.commit()
+        await send_mod_log(
+            context,
+            chat,
+            f"⚠️ {mention(member.user)} ʀᴇᴀᴄʜᴇᴅ {limit} ᴡᴀʀɴɪɴɢs → {action}.",
+            settings,
+        )
+        await safe_reply(
+            update,
+            f"⚠️ {esc(target_name)} ʀᴇᴀᴄʜᴇᴅ {limit} ᴡᴀʀɴɪɴɢs. ᴀᴄᴛɪᴏɴ: <b>{action}</b>.",
+        )
+        return
+
     try:
         if command in {"ban", "tban"}:
-            await context.bot.ban_chat_member(update.effective_chat.id, target_id)
+            if duration:
+                await context.bot.ban_chat_member(
+                    chat.id, target_id, until_date=now() + duration
+                )
+            else:
+                await context.bot.ban_chat_member(chat.id, target_id)
         elif command == "unban":
-            await context.bot.unban_chat_member(update.effective_chat.id, target_id, only_if_banned=True)
+            await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
         elif command == "kick":
-            await context.bot.ban_chat_member(update.effective_chat.id, target_id)
-            await context.bot.unban_chat_member(update.effective_chat.id, target_id, only_if_banned=True)
-        elif command in {"mute", "tmute"}:
-            await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=__import__("telegram").ChatPermissions(can_send_messages=False))
-        elif command == "unmute":
-            await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=__import__("telegram").ChatPermissions(can_send_messages=True, can_send_other_messages=True))
-        elif command == "warn":
-            with STORE.transaction():
-                STORE.db.execute(
-                    "INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,1) "
-                    "ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1",
-                    (update.effective_chat.id, target_id),
+            await context.bot.ban_chat_member(chat.id, target_id)
+            try:
+                await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
+            except TelegramError:
+                await safe_reply(
+                    update,
+                    f"⚠️ {esc(target_name)} ᴡᴀs ʙᴀɴɴᴇᴅ, ʙᴜᴛ ᴛʜᴇ ᴋɪᴄᴋ ᴜɴʙᴀɴ ғᴀɪʟᴇᴅ. ᴜsᴇ /unban {target_id}.",
                 )
-                warning = STORE.db.execute(
-                    "SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
-                    (update.effective_chat.id, target_id),
-                ).fetchone()
-            chat_row = STORE.chat(update.effective_chat.id, update.effective_chat.title or "")
-            settings = modcfg.load_settings(chat_row)
-            limit = int(settings.get("warn_limit", 3))
-            if warning["count"] >= limit:
-                action = str(settings.get("warn_action", "mute"))
-                if action == "ban":
-                    await context.bot.ban_chat_member(update.effective_chat.id, target_id)
-                elif action == "kick":
-                    await context.bot.ban_chat_member(update.effective_chat.id, target_id)
-                    await context.bot.unban_chat_member(update.effective_chat.id, target_id, only_if_banned=True)
-                else:
-                    await context.bot.restrict_chat_member(
-                        update.effective_chat.id,
-                        target_id,
-                        ChatPermissions(can_send_messages=False),
-                    )
-                STORE.db.execute(
-                    "DELETE FROM warnings WHERE chat_id=? AND user_id=?",
-                    (update.effective_chat.id, target_id),
-                )
-                STORE.db.commit()
-                await send_mod_log(
-                    context,
-                    update.effective_chat,
-                    f"⚠️ {mention(target)} ʀᴇᴀᴄʜᴇᴅ {limit} ᴡᴀʀɴɪɴɢs → {action}.",
-                    settings,
-                )
-                await safe_reply(update, f"⚠️ {esc(target['name'])} ʀᴇᴀᴄʜᴇᴅ {limit} ᴡᴀʀɴɪɴɢs. ᴀᴄᴛɪᴏɴ: {action}.")
                 return
-            await safe_reply(update, f"⚠️ ᴡᴀʀɴᴇᴅ {esc(target['name'])}. ᴡᴀʀɴɪɴɢs: {warning['count']}.")
-            return
+        elif command in {"mute", "tmute"}:
+            kwargs = {"until_date": now() + duration} if duration else {}
+            await context.bot.restrict_chat_member(
+                chat.id,
+                target_id,
+                ChatPermissions(can_send_messages=False),
+                **kwargs,
+            )
+        elif command == "unmute":
+            await context.bot.restrict_chat_member(
+                chat.id, target_id, permissions=chat_default_permissions(chat)
+            )
         elif command == "promote":
             await context.bot.promote_chat_member(
-                update.effective_chat.id,
+                chat.id,
                 target_id,
                 can_manage_chat=True,
                 can_delete_messages=True,
@@ -4159,57 +4847,68 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         elif command == "demote":
             await context.bot.promote_chat_member(
-                update.effective_chat.id,
+                chat.id,
                 target_id,
                 can_manage_chat=False,
                 can_delete_messages=False,
                 can_restrict_members=False,
                 can_invite_users=False,
                 can_pin_messages=False,
+                can_change_info=False,
+                can_promote_members=False,
+                can_manage_topics=False,
+                can_manage_video_chats=False,
             )
-        elif command == "pin" and update.effective_message.reply_to_message:
-            await update.effective_message.reply_to_message.pin()
-        elif command == "unpin":
-            await context.bot.unpin_chat_message(update.effective_chat.id)
-        elif command == "lock":
-            await context.bot.set_chat_permissions(update.effective_chat.id, __import__("telegram").ChatPermissions(can_send_messages=False))
-        elif command == "unlock":
-            await context.bot.set_chat_permissions(update.effective_chat.id, __import__("telegram").ChatPermissions(can_send_messages=True, can_send_other_messages=True))
-        await safe_reply(update, f"✅ /{command} ᴅᴏɴᴇ ғᴏʀ {esc(target['name'])}.")
+        else:
+            await safe_reply(update, "❌ ᴜɴᴋɴᴏᴡɴ ᴀᴅᴍɪɴ ᴄᴏᴍᴍᴀɴᴅ.")
+            return
     except TelegramError as exc:
-        log.warning("Moderation command failed: %s", exc)
-        await safe_reply(update, "❌ ᴛʜᴇ ʙᴏᴛ ɴᴇᴇᴅs ᴀᴅᴍɪɴ ᴘᴇʀᴍɪssɪᴏɴs ғᴏʀ ᴛʜɪs.")
+        log.warning("Moderation command failed: %s", type(exc).__name__)
+        await safe_reply(
+            update,
+            f"❌ /{command} ғᴀɪʟᴇᴅ. ᴄʜᴇᴄᴋ ᴍʏ ᴀᴅᴍɪɴ ʀɪɢʜᴛs ᴀɴᴅ ᴛʜᴇ ᴛᴀʀɢᴇᴛ.",
+        )
+        return
+
+    suffix = f" ғᴏʀ {duration_text(duration)}" if duration else ""
+    await safe_reply(update, f"✅ /{command} ᴅᴏɴᴇ ғᴏʀ {esc(target_name)}{suffix}.")
 
 
 async def warnings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or update.effective_chat.type == ChatType.PRIVATE:
+    if not update.effective_chat or update.effective_chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await safe_reply(update, "ᴛʜɪs ᴄᴏᴍᴍᴀɴᴅ ᴡᴏʀᴋs ɪɴ ɢʀᴏᴜᴘs.")
         return
     target_id, target = await target_user(update, context.args)
+    if target_id <= 0 or not target:
+        await safe_reply(update, "❌ ᴜsᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ. ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇɪʀ ᴍᴇssᴀɢᴇ ᴏʀ ᴜsᴇ ᴀ ᴋɴᴏᴡɴ @ᴜsᴇʀɴᴀᴍᴇ/ɪᴅ.")
+        return
     row = STORE.db.execute(
         "SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
         (update.effective_chat.id, target_id),
     ).fetchone()
     await safe_reply(
         update,
-        f"⚠️ <b>ᴡᴀʀɴɪɴɢs ғᴏʀ {esc(target['name'] if target else str(target_id))}</b>: {row['count'] if row else 0}",
+        f"⚠️ <b>ᴡᴀʀɴɪɴɢs ғᴏʀ {esc(target['name'])}</b>: {row['count'] if row else 0}",
     )
 
 
 async def reset_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or update.effective_chat.type == ChatType.PRIVATE:
+    if not update.effective_chat or update.effective_chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await safe_reply(update, "ᴛʜɪs ᴄᴏᴍᴍᴀɴᴅ ᴡᴏʀᴋs ɪɴ ɢʀᴏᴜᴘs.")
         return
     if not await is_group_admin(update, context):
         await safe_reply(update, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.")
         return
     target_id, target = await target_user(update, context.args)
+    if target_id <= 0 or not target:
+        await safe_reply(update, "❌ ᴜsᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ. ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇɪʀ ᴍᴇssᴀɢᴇ ᴏʀ ᴜsᴇ ᴀ ᴋɴᴏᴡɴ @ᴜsᴇʀɴᴀᴍᴇ/ɪᴅ.")
+        return
     STORE.db.execute(
         "DELETE FROM warnings WHERE chat_id=? AND user_id=?",
         (update.effective_chat.id, target_id),
     )
     STORE.db.commit()
-    await safe_reply(update, f"✅ ᴡᴀʀɴɪɴɢs ʀᴇsᴇᴛ ғᴏʀ {esc(target['name'] if target else str(target_id))}.")
+    await safe_reply(update, f"✅ ᴡᴀʀɴɪɴɢs ʀᴇsᴇᴛ ғᴏʀ {esc(target['name'])}.")
 
 
 async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4330,7 +5029,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await answer_callback(query)
     if query.data == "explore":
         await edit_callback_message(
             query,
@@ -4497,6 +5196,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await answer_callback(query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True)
             return
         key = query.data.split(":", 2)[2]
+        if key not in modcfg.PROTECTION_LABELS:
+            await answer_callback(query, "ᴜɴᴋɴᴏᴡɴ ᴘʀᴏᴛᴇᴄᴛɪᴏɴ sᴇᴛᴛɪɴɢ.", show_alert=True)
+            return
         row = STORE.chat(query.message.chat.id, query.message.chat.title or "")
         settings = modcfg.load_settings(row)
         try:
@@ -4551,15 +5253,25 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.restrict_chat_member(
                 chat.id,
                 target_id,
-                full_member_permissions(),
+                chat_default_permissions(chat),
             )
+        except TelegramError:
+            await answer_callback(
+                query, "ᴠᴇʀɪғɪᴄᴀᴛɪᴏɴ ғᴀɪʟᴇᴅ. ᴀsᴋ ᴀɴ ᴀᴅᴍɪɴ.", show_alert=True
+            )
+            return
+        try:
             await edit_callback_message(
                 query,
                 f"✅ {mention(query.from_user)} ᴠᴇʀɪғɪᴇᴅ. ᴡᴇʟᴄᴏᴍᴇ!",
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
-            await answer_callback(query, "ᴠᴇʀɪғɪᴄᴀᴛɪᴏɴ ғᴀɪʟᴇᴅ. ᴀsᴋ ᴀɴ ᴀᴅᴍɪɴ.", show_alert=True)
+            await answer_callback(
+                query,
+                "✅ ʏᴏᴜ ᴀʀᴇ ᴠᴇʀɪғɪᴇᴅ, ʙᴜᴛ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ᴇᴅɪᴛ ᴛʜɪs ᴍᴇssᴀɢᴇ.",
+                show_alert=True,
+            )
     elif query.data == "cat:moderation":
         await edit_callback_message(
             query,
@@ -4704,6 +5416,8 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     is_command = bool(message.text and message.text.startswith("/"))
 
     if chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        if is_command:
+            return
         row = STORE.chat(chat.id, chat.title or "")
         settings = modcfg.load_settings(row)
         violation = ""
@@ -4794,11 +5508,12 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     violation = "antiflood"
 
         if violation and not await is_group_admin(update, context):
+            removed = True
             try:
                 await message.delete()
             except TelegramError:
-                pass
-            await safe_reply(update, violation_warning(violation, user))
+                removed = False
+            await safe_reply(update, violation_warning(violation, user, removed))
             await apply_penalty(
                 context,
                 chat,
@@ -4810,9 +5525,6 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        if is_command:
-            return
-
     is_sticker = bool(message.sticker)
     if not text and not is_sticker:
         return
@@ -4822,9 +5534,8 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "SELECT word FROM blacklists WHERE chat_id=?",
             (update.effective_chat.id,),
         ).fetchall()
-        lowered = text.lower()
         for row in blacklisted:
-            if row["word"].lower() in lowered:
+            if matches_filter_word(text, row["word"]):
                 try:
                     await update.message.delete()
                 except TelegramError:
@@ -4835,7 +5546,7 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "SELECT word,response FROM filters WHERE chat_id=?",
             (update.effective_chat.id,),
         ).fetchall():
-            if row["word"].lower() in text.lower():
+            if matches_filter_word(text, row["word"]):
                 await update.message.reply_text(row["response"])
                 return
 

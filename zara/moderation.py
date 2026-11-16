@@ -89,6 +89,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "warn_limit": 3,
     "warn_action": "mute",
     "log_channel": 0,
+    "log_enabled": True,
     "reports": False,
 }
 
@@ -247,6 +248,9 @@ def load_settings(row: Any) -> dict[str, Any]:
         except (IndexError, KeyError, TypeError):
             raw = ""
     settings = dict(DEFAULT_SETTINGS)
+    # The penalties mapping is nested; never let one chat mutate the module
+    # defaults or another chat's settings.
+    settings["penalties"] = dict(DEFAULT_PENALTIES)
     if raw:
         try:
             stored = json.loads(raw)

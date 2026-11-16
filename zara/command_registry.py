@@ -13,11 +13,12 @@ from .handlers import (
     games,
     groups,
     owner,
+    stickers,
     tools,
     utilities,
 )
 
-GROUPS = (core, economy, games, actions, groups, utilities, tools, owner)
+GROUPS = (core, economy, games, actions, groups, stickers, utilities, tools, owner)
 
 
 def build_commands(runtime: Mapping[str, Any]) -> dict[str, Callable]:

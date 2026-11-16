@@ -474,7 +474,10 @@ def _calc_node(node: ast.AST) -> int | float:
         right = _calc_node(node.right)
         if isinstance(node.op, ast.Pow) and abs(right) > 1000:
             raise ToolError("Exponent bahut bada hai.")
-        return _BINARY_OPERATORS[type(node.op)](left, right)
+        result = _BINARY_OPERATORS[type(node.op)](left, right)
+        if isinstance(result, int) and result.bit_length() > 10000:
+            raise ToolError("Result bahut bada hai.")
+        return result
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         function = _CALC_FUNCTIONS.get(node.func.id)
         if function is None or node.keywords:
