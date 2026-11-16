@@ -647,7 +647,7 @@ def auto_format_reply(text: str) -> str:
     lowered = text.lower()
     if "<pre>" in lowered or "<blockquote>" in lowered:
         return text
-    if re.search(r"<(?:a|b|i|u|s|code|tg-spoiler)\b", text, re.IGNORECASE):
+    if re.search(r"<a\b", text, re.IGNORECASE):
         return f"<blockquote>{text}</blockquote>"
     return pre_or_quote(text)
 

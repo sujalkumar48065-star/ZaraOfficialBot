@@ -619,3 +619,12 @@ async def test_ban_success_uses_blockquote_and_clickable_target(store, monkeypat
     assert sent.startswith("<blockquote>")
     assert 'href="tg://user?id=12345"' in sent
     assert "ʙᴀɴ" in sent
+
+
+@pytest.mark.asyncio
+async def test_safe_reply_strips_inline_tags_for_short_pre_text():
+    update, _, message = make_update("/anything")
+
+    await zara_bot.safe_reply(update, "📌 ᴘɪɴɴᴇᴅ <code>123</code>")
+
+    assert message.reply_text.await_args.args[0] == "<pre>📌 ᴘɪɴɴᴇᴅ 123</pre>"
