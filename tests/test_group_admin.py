@@ -515,3 +515,51 @@ def test_link_protection_pattern_catches_common_invite_and_url_forms():
     assert zara_bot.LINK_PATTERN.search("joinchat/abc")
     assert zara_bot.LINK_PATTERN.search("example.xyz")
     assert not zara_bot.LINK_PATTERN.search("hello world")
+
+
+@pytest.mark.asyncio
+async def test_kill_creates_actor_row_before_updating_stats(store, monkeypatch):
+    actor_id = 706
+    target = SimpleNamespace(id=707, username="target", full_name="Target", is_bot=False)
+    target_row = store.user(target)
+    monkeypatch.setattr(
+        zara_bot, "target_user", AsyncMock(return_value=(target.id, target_row))
+    )
+    monkeypatch.setattr(zara_bot, "invincible", lambda _: False)
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    update, context, _ = make_update("/kill", user_id=actor_id)
+
+    await zara_bot.kill(update, context)
+
+    actor = store.db.execute(
+        "SELECT kills FROM users WHERE user_id=?", (actor_id,)
+    ).fetchone()
+    target_after = store.db.execute(
+        "SELECT dead FROM users WHERE user_id=?", (target.id,)
+    ).fetchone()
+    assert actor["kills"] == 1
+    assert target_after["dead"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rob_creates_actor_row_before_crediting(store, monkeypatch):
+    actor_id = 708
+    target = SimpleNamespace(id=709, username="target2", full_name="Target Two", is_bot=False)
+    target_row = store.user(target)
+    store.db.execute("UPDATE users SET balance=500 WHERE user_id=?", (target.id,))
+    store.db.commit()
+    monkeypatch.setattr(
+        zara_bot, "target_user", AsyncMock(return_value=(target.id, target_row))
+    )
+    monkeypatch.setattr(zara_bot, "invincible", lambda _: False)
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    update, context, _ = make_update("/rob", user_id=actor_id)
+
+    await zara_bot.rob(update, context)
+
+    actor = store.db.execute(
+        "SELECT balance FROM users WHERE user_id=?", (actor_id,)
+    ).fetchone()
+    assert actor["balance"] > 0

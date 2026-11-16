@@ -3391,6 +3391,7 @@ async def protect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def rob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STORE.user(update.effective_user)
     target_id, target = await target_user(update, context.args)
     if target_id == update.effective_user.id or not target:
         await safe_reply(update, "ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴜsᴇʀ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ʀᴏʙ.")
@@ -3409,6 +3410,7 @@ async def rob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STORE.user(update.effective_user)
     target_id, target = await target_user(update, context.args)
     if not target or target_id == update.effective_user.id:
         await safe_reply(update, "ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴛᴀʀɢᴇᴛ ᴜsᴇʀ.")
