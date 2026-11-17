@@ -690,3 +690,21 @@ async def test_owner_gif_capture_parses_slash_space_caption(tmp_path, monkeypatc
     await zara_bot.capture_owner_gif(update, context)
 
     assert (tmp_path / "hug.mp4").read_bytes() == b"captured"
+
+
+def test_auto_format_uses_blockquote_for_long_or_multiline_text():
+    long_text = "x" * (zara_bot.PRE_TEXT_MAX + 1)
+    multiline = "line one\nline two\nline three"
+
+    assert zara_bot.auto_format_reply(long_text).startswith("<blockquote>")
+    assert zara_bot.auto_format_reply(multiline).startswith("<blockquote>")
+
+
+@pytest.mark.asyncio
+async def test_private_text_is_not_captured_or_replied_to(tmp_path, monkeypatch):
+    monkeypatch.setattr(zara_bot, "CAPTURE_DIR", tmp_path)
+    update, context, message = make_update("hello", user_id=zara_bot.OWNER_ID)
+
+    await zara_bot.capture_owner_gif(update, context)
+
+    message.reply_text.assert_not_awaited()

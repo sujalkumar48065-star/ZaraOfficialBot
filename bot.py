@@ -572,7 +572,7 @@ def esc(value: str | None) -> str:
     return html.escape(value or "unknown", quote=False)
 
 
-PRE_TEXT_MAX = 220
+PRE_TEXT_MAX = 120
 MODERATION_REPLY_COMMANDS = frozenset(
     {
         "ban",
@@ -637,7 +637,7 @@ def pre_or_quote(value: str, limit: int = PRE_TEXT_MAX) -> str:
     """Use pre for short replies, blockquote as the long-text fallback."""
     plain = html.unescape(re.sub(r"<[^>]+>", "", value))
     safe = html.escape(plain, quote=False)
-    if len(plain) > limit or plain.count("\n") > 2:
+    if len(plain) > limit or plain.count("\n") > 1:
         return f"<blockquote>{safe}</blockquote>"
     return f"<pre>{safe}</pre>"
 
@@ -5822,7 +5822,11 @@ def add_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_members))
     app.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE, capture_owner_gif)
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & (filters.ANIMATION | filters.VIDEO | filters.Document.ALL),
+            capture_owner_gif,
+        )
     )
     app.add_handler(
         MessageHandler(
