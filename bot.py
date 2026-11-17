@@ -4261,17 +4261,17 @@ async def ai_reply(
         user_gender=zara_ai.detect_user_gender(text),
         replied_sender=replied_sender,
         replied_text=replied_text,
+        length="short",
+        max_tokens=120,
     )
     if not result:
-        if chat.type == ChatType.PRIVATE:
-            await safe_reply(
-                update,
-                "Thoda network slow hai, par main sun rahi hoon 💗",
-            )
         return
 
     zara_ai.MEMORY.store(chat.id, user.id, "assistant", result.text)
-    await safe_reply(update, esc(result.text))
+    try:
+        await message.reply_text(styled(result.text))
+    except TelegramError as exc:
+        log.info("AI reply failed: %s", type(exc).__name__)
 
 
 def parse_cards(text: str) -> int | None:
