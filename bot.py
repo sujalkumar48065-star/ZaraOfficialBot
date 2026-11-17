@@ -3921,31 +3921,39 @@ async def capture_owner_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     message = update.effective_message
     if not message:
         return
-    caption = (message.caption or "").strip().lower()
-    command = caption.split()[0].lstrip("/") if caption else ""
-    if command not in ACTION_NAMES:
-        await safe_reply(
-            update,
-            "sᴇɴᴅ ᴀ ɢɪғ ᴡɪᴛʜ ᴄᴀᴘᴛɪᴏɴ: " + ", ".join(ACTION_NAMES),
-        )
-        return
-    media = message.animation or message.video or message.document
+    media = (
+        getattr(message, "animation", None)
+        or getattr(message, "video", None)
+        or getattr(message, "document", None)
+    )
+    log.info(
+        "Owner DM: text=%s caption=%r animation=%s video=%s document=%s sticker=%s",
+        bool(getattr(message, "text", None)),
+        getattr(message, "caption", None),
+        bool(getattr(message, "animation", None)),
+        bool(getattr(message, "video", None)),
+        bool(getattr(message, "document", None)),
+        bool(getattr(message, "sticker", None)),
+    )
     if not media:
         return
+    caption = (message.caption or "").strip().lower()
+    command = caption.split()[0].lstrip("/") if caption else ""
     mime = (getattr(media, "mime_type", "") or "").lower()
     extension = ".gif" if "gif" in mime else ".mp4"
+    name = command if command in ACTION_NAMES else f"incoming-{message.message_id}"
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
-    path = CAPTURE_DIR / f"{command}{extension}"
+    path = CAPTURE_DIR / f"{name}{extension}"
     try:
         telegram_file = await context.bot.get_file(media.file_id)
         await telegram_file.download_to_drive(custom_path=path)
     except TelegramError as exc:
-        log.warning("GIF capture failed for %s: %s", command, type(exc).__name__)
-        await safe_reply(update, f"❌ ғᴀɪʟᴇᴅ ᴛᴏ sᴀᴠᴇ {command}.")
+        log.warning("GIF capture failed for %s: %s", name, type(exc).__name__)
+        await safe_reply(update, f"❌ ғᴀɪʟᴇᴅ ᴛᴏ sᴀᴠᴇ {name}.")
         return
     await safe_reply(
         update,
-        f"✅ sᴀᴠᴇᴅ {command}{extension} ({path.stat().st_size:,} ʙʏᴛᴇs).",
+        f"✅ sᴀᴠᴇᴅ {name}{extension} ({path.stat().st_size:,} ʙʏᴛᴇs).",
     )
 
 
@@ -5809,9 +5817,7 @@ def add_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_members))
     app.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE
-            & filters.User(OWNER_ID)
-            & (filters.ANIMATION | filters.VIDEO | filters.Document.ALL),
+            filters.ChatType.PRIVATE & filters.User(OWNER_ID),
             capture_owner_gif,
         )
     )

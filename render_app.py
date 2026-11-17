@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import threading
@@ -24,12 +25,26 @@ class HealthHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/capture/"):
             token = parse_qs(parsed.query).get("token", [""])[0]
+            if not CAPTURE_TOKEN or token != CAPTURE_TOKEN:
+                self.send_response(404)
+                self.end_headers()
+                return
+            if parsed.path == "/capture/":
+                files = (
+                    sorted(path.name for path in CAPTURE_DIR.iterdir() if path.is_file())
+                    if CAPTURE_DIR.is_dir()
+                    else []
+                )
+                body = json.dumps(files).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             name = parsed.path.rsplit("/", 1)[-1]
-            if (
-                not CAPTURE_TOKEN
-                or token != CAPTURE_TOKEN
-                or not CAPTURE_NAME.fullmatch(name)
-            ):
+            if not CAPTURE_NAME.fullmatch(name):
                 self.send_response(404)
                 self.end_headers()
                 return

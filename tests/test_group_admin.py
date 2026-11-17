@@ -653,13 +653,21 @@ async def test_owner_gif_capture_saves_animation(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_owner_gif_capture_requires_action_caption(tmp_path, monkeypatch):
+async def test_owner_gif_capture_saves_unknown_caption_as_incoming(tmp_path, monkeypatch):
     monkeypatch.setattr(zara_bot, "CAPTURE_DIR", tmp_path)
     update, context, message = make_update("", user_id=zara_bot.OWNER_ID)
     message.caption = "random"
     message.animation = SimpleNamespace(file_id="animation-id", mime_type="video/mp4")
 
+    class FakeFile:
+        async def download_to_drive(self, custom_path):
+            from pathlib import Path
+
+            Path(custom_path).write_bytes(b"captured")
+
+    context.bot.get_file = AsyncMock(return_value=FakeFile())
+
     await zara_bot.capture_owner_gif(update, context)
 
-    assert not list(tmp_path.iterdir())
-    assert "ᴄᴀᴘᴛɪᴏɴ" in message.reply_text.await_args.args[0]
+    assert (tmp_path / f"incoming-{message.message_id}.mp4").exists()
+    assert "sᴀᴠᴇᴅ incoming-" in message.reply_text.await_args.args[0]
