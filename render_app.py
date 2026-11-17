@@ -23,6 +23,20 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         parsed = urlparse(self.path)
+        if parsed.path in {"/verify", "/verify/"}:
+            path = Path(__file__).with_name("webapp") / "index.html"
+            if not path.is_file():
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if parsed.path.startswith("/capture/"):
             token = parse_qs(parsed.query).get("token", [""])[0]
             if not CAPTURE_TOKEN or token != CAPTURE_TOKEN:
