@@ -37,7 +37,7 @@ def test_defaults_match_group_policy(tmp_path) -> None:
         row = db.execute("SELECT * FROM chats WHERE chat_id=?", (-1001,)).fetchone()
         settings = load_settings(row)
         assert settings["welcome_enabled"] is True
-        assert settings["goodbye_enabled"] is False
+        assert settings["goodbye_enabled"] is True
         assert settings["antilink"] is False
         assert settings["antiinline"] is False
         assert settings["antimedia"] is False
@@ -62,7 +62,7 @@ def test_save_and_reload_settings(tmp_path) -> None:
         assert reloaded["antilink"] is True
         assert reloaded["welcome_enabled"] is False
         assert reloaded["flood_limit"] == 7
-        assert reloaded["goodbye_enabled"] is False
+        assert reloaded["goodbye_enabled"] is True
     finally:
         db.close()
 

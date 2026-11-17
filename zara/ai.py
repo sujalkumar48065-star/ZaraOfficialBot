@@ -421,6 +421,22 @@ def _provider_configs() -> list[tuple[str, str, str, str]]:
     return providers
 
 
+def _provider_candidates() -> list[tuple[str, str, str, str]]:
+    """Expand providers with safe fallback models for the same endpoint."""
+    candidates: list[tuple[str, str, str, str]] = []
+    for provider, endpoint, key, model in _provider_configs():
+        candidates.append((provider, endpoint, key, model))
+        if (
+            provider == "grok"
+            and "groq.com" in endpoint
+            and model != "openai/gpt-oss-120b"
+        ):
+            candidates.append(
+                ("grok-fallback", endpoint, key, "openai/gpt-oss-120b")
+            )
+    return candidates
+
+
 def has_ai_key() -> bool:
     return bool(_provider_configs())
 
@@ -649,7 +665,9 @@ async def _call_provider(
 ) -> str:
     headers = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
         "Authorization": f"Bearer {key}",
+        "User-Agent": "ZaraBot/1.0 (+https://t.me/Meee_Zarabot)",
     }
     if provider == "openrouter":
         headers.update(
@@ -673,12 +691,43 @@ async def _call_provider(
                 "max_tokens": max_tokens,
             },
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = (exc.response.text or "")[:400].replace("\n", " ")
+            log.warning(
+                "%s chat HTTP %s: %s",
+                provider,
+                exc.response.status_code,
+                body,
+            )
+            raise
         data = response.json()
     try:
         return _clean_reply(data["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as exc:
         raise AIError(f"{provider} returned an invalid response") from exc
+
+
+def fallback_reply(text: str, language: str = "auto") -> str:
+    """Last-resort reply so AI chat never goes completely silent."""
+    value = (text or "").strip().lower()
+    english = language == "english"
+    if "good morning" in value or re.search(r"\bgm\b", value):
+        return "gm! hope u slept well ☀️" if english else "good morninggg! itni jaldi uth gaye? 🥱"
+    if "good night" in value or re.search(r"\bgn\b", value):
+        return "gn! sweet dreams 💤✨" if english else "gn gn! sweet dreams 😴✨"
+    if any(word in value for word in ("how are you", "how r u", "kaise ho", "kaisi ho", "kya haal")):
+        return "im good, u batao? 😊" if english else "main thik hu, tu bata kaisa hai? 😊"
+    if any(word in value for word in ("i love you", "love you", "pyar", "pyaar", "miss you", "miss u")):
+        return "aww that was fast 😂 coffee first?" if english else "haye itni jaldi? pehle coffee toh pila de 🙈"
+    if any(word in value for word in ("sad", "udaas", "dukhi", "akela", "alone", "tired", "thak")):
+        return "kya hua? mujhe bata na, main hu na yahan ❤️" if not english else "what happened? talk to me ❤️"
+    if re.search(r"\b(hi|hello|hey|hii|namaste)\b", value):
+        return "heyy! what's up? 😊" if english else "heyy! kya haal hai? 😊"
+    if value.endswith("?"):
+        return "hmm... soch rahi hu. tu kya sochta hai? 🤔" if not english else "hmm... what do u think? 🤔"
+    return "acha? aur bata 😊" if not english else "ohh okay, tell me more 😊"
 
 
 async def generate_reply(
@@ -697,8 +746,7 @@ async def generate_reply(
     max_tokens: int = 300,
     temperature: float = 0.9,
 ) -> AIReply | None:
-    providers = _provider_configs()
-    if not providers:
+    if not has_ai_key():
         return None
     language = detect_language(text)
     emotion = detect_emotion(text, sticker_emoji)
@@ -727,8 +775,9 @@ async def generate_reply(
         {"role": "user", "content": text or "(sticker sent)"},
     ]
     last_error: Exception | None = None
+    candidates = _provider_candidates()
     for attempt in range(2):
-        for provider, endpoint, key, model in providers:
+        for provider, endpoint, key, model in candidates:
             try:
                 reply = await _call_provider(
                     provider,
@@ -746,9 +795,12 @@ async def generate_reply(
                 last_error = exc
                 log.warning("%s chat provider failed: %s", provider, type(exc).__name__)
         if attempt == 0:
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(1.5)
     if last_error:
         log.warning("All chat providers failed: %s", type(last_error).__name__)
+    fallback = fallback_reply(text, language)
+    if fallback:
+        return AIReply(text=fallback, provider="local", model="fallback")
     return None
 
 

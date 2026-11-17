@@ -61,11 +61,12 @@ from telegram import (
     WebAppInfo,
 )
 from telegram.constants import ChatAction, ChatMemberStatus, ChatType, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
@@ -138,6 +139,7 @@ LONG_MESSAGE_LIMIT = 1000
 CONFIG_MESSAGE_TTL = 30
 _AUTO_DELETE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 _ANSWERED_CALLBACKS: set[str] = set()
+_MEMBER_EVENTS: dict[tuple[int, int, str], float] = {}
 VIOLATION_WARNINGS = {
     "antibio": "aapke bio me link hai, pehle link hatao",
     "antilink": "links are not allowed in this group",
@@ -1363,30 +1365,55 @@ async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
             return await update.effective_message.reply_text(
                 text, parse_mode=ParseMode.HTML, **kwargs
             )
+        except RetryAfter as exc:
+            log.warning("Telegram flood control in safe_reply: %ss", exc.retry_after)
+            return None
         except TelegramError:
             try:
                 return await update.effective_message.reply_text(
                     re.sub("<[^>]+>", "", text),
                     **{k: v for k, v in kwargs.items() if k != "parse_mode"},
                 )
+            except RetryAfter as exc:
+                log.warning(
+                    "Telegram flood control in safe_reply fallback: %ss",
+                    exc.retry_after,
+                )
+                return None
             except TelegramError:
                 return None
     return None
 
 
 async def send_chat_notice(
-    context: ContextTypes.DEFAULT_TYPE, chat: Any, text: str
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    text: str,
+    **kwargs: Any,
 ) -> None:
     """Send a group notice without replying to a message that may be deleted."""
+    send_kwargs = dict(kwargs)
+    send_kwargs.setdefault("parse_mode", ParseMode.HTML)
+    try:
+        await context.bot.send_message(chat.id, text, **send_kwargs)
+        return
+    except RetryAfter as exc:
+        log.warning("Telegram flood control in group notice: %ss", exc.retry_after)
+        return
+    except TelegramError:
+        pass
+    plain_kwargs = {k: v for k, v in kwargs.items() if k != "parse_mode"}
     try:
         await context.bot.send_message(
-            chat.id, text, parse_mode=ParseMode.HTML
+            chat.id, re.sub("<[^>]+>", "", text), **plain_kwargs
+        )
+    except RetryAfter as exc:
+        log.warning(
+            "Telegram flood control in group notice fallback: %ss",
+            exc.retry_after,
         )
     except TelegramError:
-        try:
-            await context.bot.send_message(chat.id, re.sub("<[^>]+>", "", text))
-        except TelegramError:
-            log.info("Could not send group notice in %s", chat.id)
+        log.info("Could not send group notice in %s", chat.id)
 
 
 async def edit_callback_message(
@@ -2158,18 +2185,19 @@ async def post_init(application: Application) -> None:
         await bot.set_my_commands([BotCommand(a, b) for a, b in owner_commands], scope=BotCommandScopeChat(OWNER_ID))
     except TelegramError as exc:
         log.warning("Could not set owner command menu: %s", exc)
-    # These profile updates are cosmetic. Telegram can rate-limit them for
-    # hours; never let that stop the actual polling service from starting.
-    try:
-        await bot.set_my_description(
-            "Zara — a gaming, economy, moderation and Hinglish chat companion for Telegram groups."
-        )
-    except TelegramError as exc:
-        log.warning("Could not set bot description: %s", exc)
-    try:
-        await bot.set_my_name("Zara")
-    except TelegramError as exc:
-        log.warning("Could not set bot name: %s", exc)
+    # These profile updates are cosmetic. Telegram rate-limits them for hours,
+    # so only run them when explicitly requested by the owner.
+    if os.getenv("ZARA_UPDATE_PROFILE", "").strip().lower() in {"1", "true", "yes"}:
+        try:
+            await bot.set_my_description(
+                "Zara — a gaming, economy, moderation and Hinglish chat companion for Telegram groups."
+            )
+        except TelegramError as exc:
+            log.warning("Could not set bot description: %s", exc)
+        try:
+            await bot.set_my_name("Zara")
+        except TelegramError as exc:
+            log.warning("Could not set bot name: %s", exc)
     application.bot_data["username"] = me.username or "ZaraBot"
     await load_sticker_packs(application)
     if app_config.SELF_PING_URL and application.job_queue is not None:
@@ -2225,94 +2253,80 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(update, text, reply_markup=keyboard)
 
 
-async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.new_chat_members:
+def member_event_seen(chat_id: int, user_id: int, action: str, ttl: int = 20) -> bool:
+    """Deduplicate join/leave updates that arrive as both service and member events."""
+    key = (int(chat_id), int(user_id), action)
+    current = time.monotonic()
+    previous = _MEMBER_EVENTS.get(key)
+    if previous and current - previous < ttl:
+        return True
+    _MEMBER_EVENTS[key] = current
+    if len(_MEMBER_EVENTS) > 2000:
+        cutoff = current - ttl
+        for item, stamp in list(_MEMBER_EVENTS.items()):
+            if stamp < cutoff:
+                _MEMBER_EVENTS.pop(item, None)
+    return False
+
+
+async def send_welcome(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    row: sqlite3.Row,
+    settings: dict[str, Any],
+    new_user: Any,
+) -> None:
+    if not settings.get("welcome_enabled"):
         return
-    chat = update.effective_chat
+    template = row["welcome"] or modcfg.DEFAULT_WELCOME
+    text = render_template(template, new_user, chat)
+    await send_chat_notice(context, chat, text)
+    log.info("Welcome sent for %s in %s", new_user.id, chat.id)
+
+
+async def process_join(
+    context: ContextTypes.DEFAULT_TYPE, chat: Any, new_user: Any
+) -> None:
+    if not chat or not new_user:
+        return
+    if member_event_seen(chat.id, new_user.id, "join"):
+        return
     row = STORE.chat(chat.id, chat.title or "")
     settings = modcfg.load_settings(row)
-    for new_user in update.message.new_chat_members:
-        if new_user.is_bot:
-            if new_user.id == context.bot.id:
-                await update.message.reply_text(
-                    "🃏 <b>ʜɪɪɪ, ᴛʜᴀɴᴋ ʏᴏᴜ ғᴏʀ ᴀᴅᴅɪɴɢ ᴢᴀʀᴀ!</b>\n\n"
-                    "<blockquote>"
-                    f"▫️ {styled('Card game')}: /bet 2000 → /card → /flip a\n"
-                    f"🔹 {styled('Economy')}: /bal • /daily • /leaderboard\n"
-                    f"▪️ {styled('Group tools')}: /rules • /welcome • /admins"
-                    "</blockquote>\n\n"
-                    f"📢 ᴜᴘᴅᴀᴛᴇs: {UPDATE_CHANNEL_LABEL}\n"
-                    f"💬 sᴜᴘᴘᴏʀᴛ: @{SUPPORT_USERNAME}\n"
-                    "ᴜsᴇ /help ғᴏʀ ᴛʜᴇ ᴄᴏᴍᴘʟᴇᴛᴇ ᴍᴇɴᴜ.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [[
-                            InlineKeyboardButton(
-                                "➕ ᴏᴘᴇɴ ᴢᴀʀᴀ",
-                                url=(
-                                    "https://t.me/"
-                                    f"{context.application.bot_data.get('username', 'ZaraBot')}"
-                                ),
+
+    if new_user.is_bot:
+        if new_user.id == context.bot.id:
+            await send_chat_notice(
+                context,
+                chat,
+                "🃏 <b>ʜɪɪɪ, ᴛʜᴀɴᴋ ʏᴏᴜ ғᴏʀ ᴀᴅᴅɪɴɢ ᴢᴀʀᴀ!</b>\n\n"
+                "<blockquote>"
+                f"▫️ {styled('Card game')}: /bet 2000 → /card → /flip a\n"
+                f"🔹 {styled('Economy')}: /bal • /daily • /leaderboard\n"
+                f"▪️ {styled('Group tools')}: /rules • /welcome • /admins"
+                "</blockquote>\n\n"
+                f"📢 ᴜᴘᴅᴀᴛᴇs: {UPDATE_CHANNEL_LABEL}\n"
+                f"💬 sᴜᴘᴘᴏʀᴛ: @{SUPPORT_USERNAME}\n"
+                "ᴜsᴇ /help ғᴏʀ ᴛʜᴇ ᴄᴏᴍᴘʟᴇᴛᴇ ᴍᴇɴᴜ.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[
+                        InlineKeyboardButton(
+                            "➕ ᴏᴘᴇɴ ᴢᴀʀᴀ",
+                            url=(
+                                "https://t.me/"
+                                f"{context.application.bot_data.get('username', 'ZaraBot')}"
                             ),
-                            *(
-                                [InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇs", url=UPDATE_CHANNEL_URL)]
-                                if UPDATE_CHANNEL_URL
-                                else []
-                            ),
-                        ]]
-                    ),
-                )
-                continue
-            if settings.get("antibot"):
-                allowed, error = await bot_admin_check(
-                    context, chat, "can_restrict_members"
-                )
-                if not allowed:
-                    await send_mod_log(
-                        context,
-                        chat,
-                        f"🤖 {styled('anti-bot')}: ᴄᴏᴜʟᴅ ɴᴏᴛ ᴋɪᴄᴋ {mention(new_user)} — {esc(error)}",
-                        settings,
-                    )
-                    continue
-                try:
-                    member = await context.bot.get_chat_member(chat.id, new_user.id)
-                    if member.status in {
-                        ChatMemberStatus.ADMINISTRATOR,
-                        ChatMemberStatus.OWNER,
-                    }:
-                        continue
-                    await context.bot.ban_chat_member(chat.id, new_user.id)
-                    await context.bot.unban_chat_member(
-                        chat.id, new_user.id, only_if_banned=True
-                    )
-                    await send_mod_log(
-                        context,
-                        chat,
-                        f"🤖 {styled('anti-bot')}: {mention(new_user)} ᴋɪᴄᴋᴇᴅ.",
-                        settings,
-                    )
-                except TelegramError as exc:
-                    await send_mod_log(
-                        context,
-                        chat,
-                        f"🤖 {styled('anti-bot')}: ᴄᴏᴜʟᴅ ɴᴏᴛ ᴋɪᴄᴋ {mention(new_user)} — {type(exc).__name__}",
-                        settings,
-                    )
-            continue
-        STORE.user(new_user)
-        if settings.get("welcome_enabled"):
-            template = row["welcome"] or modcfg.DEFAULT_WELCOME
-            text = render_template(template, new_user, chat)
-            try:
-                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-            except TelegramError:
-                await update.message.reply_text(re.sub("<[^>]+>", "", text))
-        approved = STORE.db.execute(
-            "SELECT 1 FROM approvals WHERE chat_id=? AND user_id=?",
-            (chat.id, new_user.id),
-        ).fetchone()
-        if settings.get("captcha") and not approved:
+                        ),
+                        *(
+                            [InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇs", url=UPDATE_CHANNEL_URL)]
+                            if UPDATE_CHANNEL_URL
+                            else []
+                        ),
+                    ]]
+                ),
+            )
+            return
+        if settings.get("antibot"):
             allowed, error = await bot_admin_check(
                 context, chat, "can_restrict_members"
             )
@@ -2320,73 +2334,102 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await send_mod_log(
                     context,
                     chat,
-                    f"🛡️ ᴄᴀᴘᴛᴄʜᴀ sᴋɪᴘᴘᴇᴅ ғᴏʀ {mention(new_user)} — {esc(error)}",
+                    f"🤖 {styled('anti-bot')}: ᴄᴏᴜʟᴅ ɴᴏᴛ ᴋɪᴄᴋ {mention(new_user)} — {esc(error)}",
                     settings,
                 )
-                continue
+                return
             try:
                 member = await context.bot.get_chat_member(chat.id, new_user.id)
                 if member.status in {
                     ChatMemberStatus.ADMINISTRATOR,
                     ChatMemberStatus.OWNER,
                 }:
-                    continue
-                await context.bot.restrict_chat_member(
-                    chat.id,
-                    new_user.id,
-                    ChatPermissions(can_send_messages=False),
+                    return
+                await context.bot.ban_chat_member(chat.id, new_user.id)
+                await context.bot.unban_chat_member(
+                    chat.id, new_user.id, only_if_banned=True
+                )
+                await send_mod_log(
+                    context,
+                    chat,
+                    f"🤖 {styled('anti-bot')}: {mention(new_user)} ᴋɪᴄᴋᴇᴅ.",
+                    settings,
                 )
             except TelegramError as exc:
                 await send_mod_log(
                     context,
                     chat,
-                    f"🛡️ ᴄᴀᴘᴛᴄʜᴀ ᴄᴏᴜʟᴅ ɴᴏᴛ ʀᴇsᴛʀɪᴄᴛ {mention(new_user)} — {type(exc).__name__}",
+                    f"🤖 {styled('anti-bot')}: ᴄᴏᴜʟᴅ ɴᴏᴛ ᴋɪᴄᴋ {mention(new_user)} — {type(exc).__name__}",
                     settings,
                 )
-                continue
-            try:
-                await update.message.reply_text(
-                    f"🛡️ {mention(new_user)}, ᴘʟᴇᴀsᴇ ᴠᴇʀɪғʏ ʏᴏᴜ ᴀʀᴇ ʜᴜᴍᴀɴ.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [[
-                            InlineKeyboardButton(
-                                "✅ ᴠᴇʀɪғʏ",
-                                callback_data=f"captcha:verify:{new_user.id}",
-                            )
-                        ]]
-                    ),
-                )
-            except TelegramError:
-                try:
-                    await context.bot.restrict_chat_member(
-                        chat.id,
-                        new_user.id,
-                        chat_default_permissions(chat),
-                    )
-                except TelegramError:
-                    pass
-                await send_mod_log(
-                    context,
-                    chat,
-                    f"🛡️ ᴄᴀᴘᴛᴄʜᴀ ᴘʀᴏᴍᴘᴛ ғᴀɪʟᴇᴅ ғᴏʀ {mention(new_user)}; ʀᴇsᴛʀɪᴄᴛɪᴏɴ ʀᴇᴠᴇʀsᴇᴅ.",
-                    settings,
-                )
-        await send_mod_log(
+        return
+
+    STORE.user(new_user)
+    await send_welcome(context, chat, row, settings, new_user)
+    approved = STORE.db.execute(
+        "SELECT 1 FROM approvals WHERE chat_id=? AND user_id=?",
+        (chat.id, new_user.id),
+    ).fetchone()
+    if settings.get("captcha") and not approved:
+        allowed, error = await bot_admin_check(
+            context, chat, "can_restrict_members"
+        )
+        if not allowed:
+            await send_mod_log(
+                context,
+                chat,
+                f"🛡️ ᴄᴀᴘᴛᴄʜᴀ sᴋɪᴘᴘᴇᴅ ғᴏʀ {mention(new_user)} — {esc(error)}",
+                settings,
+            )
+            return
+        try:
+            member = await context.bot.get_chat_member(chat.id, new_user.id)
+            if member.status in {
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            }:
+                return
+            await context.bot.restrict_chat_member(
+                chat.id,
+                new_user.id,
+                ChatPermissions(can_send_messages=False),
+            )
+        except TelegramError as exc:
+            await send_mod_log(
+                context,
+                chat,
+                f"🛡️ ᴄᴀᴘᴛᴄʜᴀ ᴄᴏᴜʟᴅ ɴᴏᴛ ʀᴇsᴛʀɪᴄᴛ {mention(new_user)} — {type(exc).__name__}",
+                settings,
+            )
+            return
+        await send_chat_notice(
             context,
             chat,
-            f"➕ {mention(new_user)} ᴊᴏɪɴᴇᴅ ᴛʜᴇ ɢʀᴏᴜᴘ.",
-            settings,
+            f"🛡️ {mention(new_user)}, ᴘʟᴇᴀsᴇ ᴠᴇʀɪғʏ ʏᴏᴜ ᴀʀᴇ ʜᴜᴍᴀɴ.",
+            reply_markup=InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "✅ ᴠᴇʀɪғʏ",
+                        callback_data=f"captcha:verify:{new_user.id}",
+                    )
+                ]]
+            ),
         )
+    await send_mod_log(
+        context,
+        chat,
+        f"➕ {mention(new_user)} ᴊᴏɪɴᴇᴅ ᴛʜᴇ ɢʀᴏᴜᴘ.",
+        settings,
+    )
 
 
-async def goodbye_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.left_chat_member:
+async def process_leave(
+    context: ContextTypes.DEFAULT_TYPE, chat: Any, left_user: Any
+) -> None:
+    if not chat or not left_user or left_user.is_bot:
         return
-    left_user = update.message.left_chat_member
-    if left_user.is_bot:
+    if member_event_seen(chat.id, left_user.id, "leave"):
         return
-    chat = update.effective_chat
     row = STORE.chat(chat.id, chat.title or "")
     settings = modcfg.load_settings(row)
     await send_mod_log(
@@ -2395,13 +2438,52 @@ async def goodbye_members(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"➖ {mention(left_user)} ʟᴇғᴛ ᴛʜᴇ ɢʀᴏᴜᴘ.",
         settings,
     )
-    if not settings.get("goodbye_enabled") or not row["goodbye"]:
+    if not settings.get("goodbye_enabled"):
         return
-    goodbye = render_template(row["goodbye"], left_user, chat)
-    try:
-        await update.message.reply_text(goodbye, parse_mode=ParseMode.HTML)
-    except TelegramError:
-        await update.message.reply_text(re.sub("<[^>]+>", "", goodbye))
+    template = row["goodbye"] or modcfg.DEFAULT_GOODBYE
+    goodbye = render_template(template, left_user, chat)
+    await send_chat_notice(context, chat, goodbye)
+    log.info("Goodbye sent for %s in %s", left_user.id, chat.id)
+
+
+async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.new_chat_members:
+        return
+    chat = update.effective_chat
+    for new_user in update.message.new_chat_members:
+        await process_join(context, chat, new_user)
+
+
+async def goodbye_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.left_chat_member:
+        return
+    await process_leave(
+        context, update.effective_chat, update.message.left_chat_member
+    )
+
+
+async def chat_member_update(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    event = update.chat_member
+    if not event:
+        return
+    old = event.old_chat_member.status
+    new = event.new_chat_member.status
+    left_statuses = {
+        ChatMemberStatus.LEFT,
+        ChatMemberStatus.BANNED,
+    }
+    active_statuses = {
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+        ChatMemberStatus.RESTRICTED,
+    }
+    if old in left_statuses and new in active_statuses:
+        await process_join(context, event.chat, event.new_chat_member.user)
+    elif old in active_statuses and new in left_statuses:
+        await process_leave(context, event.chat, event.new_chat_member.user)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2513,10 +2595,15 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_reply(update, f"👋 <b>ᴀᴄᴛɪᴠᴇ ᴡᴇʟᴄᴏᴍᴇ ({label})</b>\n<code>{esc(template)}</code>")
         return
     if command == "goodbye":
-        if not settings.get("goodbye_enabled") or not row["goodbye"]:
-            await safe_reply(update, "👋 ɢᴏᴏᴅʙʏᴇ ɪs ᴏғғ. ᴜsᴇ /setgoodbye ᴛᴏ sᴇᴛ ᴀ ᴍᴇssᴀɢᴇ.")
+        template = row["goodbye"] or modcfg.DEFAULT_GOODBYE
+        label = "ᴄᴜsᴛᴏᴍ" if row["goodbye"] else "ᴅᴇғᴀᴜʟᴛ"
+        if not settings.get("goodbye_enabled"):
+            await safe_reply(
+                update,
+                f"👋 <b>ɢᴏᴏᴅʙʏᴇ ɪs ᴏғғ ({label})</b>\n<code>{esc(template)}</code>\n\nᴜsᴇ /quicksettings ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.",
+            )
             return
-        await safe_reply(update, f"👋 <b>ɢᴏᴏᴅʙʏᴇ</b>\n<code>{esc(row['goodbye'])}</code>")
+        await safe_reply(update, f"👋 <b>ᴀᴄᴛɪᴠᴇ ɢᴏᴏᴅʙʏᴇ ({label})</b>\n<code>{esc(template)}</code>")
         return
     if command == "rules":
         await safe_reply(update, f"📜 <b>ɢʀᴏᴜᴘ ʀᴜʟᴇs</b>\n{esc(row['rules'] or 'ɴᴏ ʀᴜʟᴇs sᴇᴛ')}")
@@ -2624,9 +2711,9 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if command == "resetgoodbye":
         STORE.db.execute("UPDATE chats SET goodbye=NULL WHERE chat_id=?", (chat.id,))
         STORE.db.commit()
-        settings["goodbye_enabled"] = False
+        settings["goodbye_enabled"] = True
         modcfg.save_settings(STORE, chat.id, settings)
-        await safe_reply(update, "✅ ɢᴏᴏᴅʙʏᴇ ᴛᴜʀɴᴇᴅ ᴏғғ.")
+        await safe_reply(update, "✅ ᴅᴇғᴀᴜʟᴛ ɢᴏᴏᴅʙʏᴇ ʀᴇsᴛᴏʀᴇᴅ.")
         return
     if command == "clearrules":
         STORE.db.execute("UPDATE chats SET rules=NULL WHERE chat_id=?", (chat.id,))
@@ -5399,20 +5486,6 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         page = modcfg.quick_settings_page_for_key(key)
         row = STORE.chat(query.message.chat.id, query.message.chat.title or "")
         settings = modcfg.load_settings(row)
-        if key == "goodbye_enabled" and not settings.get("goodbye_enabled") and not row["goodbye"]:
-            await answer_callback(
-                query,
-                "⚠️ sᴇᴛ /setgoodbye ғɪʀsᴛ, ᴛʜᴇɴ ᴛᴜʀɴ ɢᴏᴏᴅʙʏᴇ ᴏɴ.",
-                show_alert=True,
-            )
-            await edit_config_message(
-                query,
-                modcfg.quick_settings_text(settings, page)
-                + "\n\n⚠️ sᴇᴛ /setgoodbye ғɪʀsᴛ.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=modular_quick_settings_keyboard(settings, page),
-            )
-            return
         try:
             enabled = modcfg.toggle_setting(settings, key)
         except KeyError:
@@ -5917,6 +5990,32 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         STORE.mark_chat_member(int(chat.id), int(user.id))
 
 
+async def error_handler(
+    update: Update | None, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Log every unhandled handler failure instead of failing silently."""
+    error = context.error
+    if isinstance(error, RetryAfter):
+        log.warning("Telegram flood control in handler: retry in %ss", error.retry_after)
+        return
+    log.error(
+        "Unhandled handler error",
+        exc_info=(type(error), error, error.__traceback__) if error else None,
+    )
+    if (
+        update
+        and update.effective_chat
+        and update.effective_chat.type == ChatType.PRIVATE
+    ):
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ Kuch technical problem aa gayi. Thodi der baad try karo.",
+            )
+        except TelegramError:
+            pass
+
+
 def add_handlers(app: Application) -> None:
     runtime = globals()
     command_map = build_commands(runtime)
@@ -5936,6 +6035,9 @@ def add_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_members))
     app.add_handler(
+        ChatMemberHandler(chat_member_update, ChatMemberHandler.CHAT_MEMBER)
+    )
+    app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
             & (filters.ANIMATION | filters.VIDEO | filters.Document.ALL),
@@ -5948,6 +6050,7 @@ def add_handlers(app: Application) -> None:
             text_filter,
         )
     )
+    app.add_error_handler(error_handler)
 
 
 def main() -> None:

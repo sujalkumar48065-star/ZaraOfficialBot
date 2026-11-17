@@ -82,3 +82,20 @@ def test_system_prompt_uses_personality_and_language():
     assert "sassy" in prompt.lower()
     assert "VERY short" in prompt
     assert "Hinglish" in prompt
+
+
+def test_local_fallback_keeps_ai_chat_alive():
+    assert ai.fallback_reply("hello", "english").startswith("heyy")
+    assert "kaal" not in ai.fallback_reply("kaise ho", "hinglish")
+    assert "kya hua" in ai.fallback_reply("main sad hu", "hinglish")
+    assert ai.fallback_reply("random text", "english")
+
+
+def test_groq_endpoint_gets_fallback_model(monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "gsk-test")
+    monkeypatch.setenv("XAI_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setenv("XAI_MODEL", "qwen/qwen3.8-27b")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    models = [item[3] for item in ai._provider_candidates()]
+    assert models == ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"]

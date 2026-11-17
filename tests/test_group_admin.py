@@ -817,3 +817,34 @@ async def test_private_text_is_not_captured_or_replied_to(tmp_path, monkeypatch)
     await zara_bot.capture_owner_gif(update, context)
 
     message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_default_welcome_and_goodbye_are_sent(store, monkeypatch):
+    zara_bot._MEMBER_EVENTS.clear()
+    context = SimpleNamespace(
+        bot=FakeBot(),
+        application=SimpleNamespace(bot_data={"username": "Meee_Zarabot"}),
+    )
+    chat = SimpleNamespace(id=-1001, title="Test Group", username="testgroup")
+    joined = SimpleNamespace(
+        id=2,
+        full_name="New User",
+        username="newuser",
+        is_bot=False,
+    )
+
+    await zara_bot.process_join(context, chat, joined)
+    welcome = context.bot.send_message.await_args.args[1]
+    assert "Welcome in Test Group" in welcome
+    assert 'href="tg://user?id=2"' in welcome
+
+    settings = modcfg.load_settings(store.chat(-1001, "Test Group"))
+    settings["goodbye_enabled"] = True
+    modcfg.save_settings(store, -1001, settings)
+    context.bot.send_message.reset_mock()
+
+    await zara_bot.process_leave(context, chat, joined)
+    goodbye = context.bot.send_message.await_args.args[1]
+    assert "ɢᴏᴏᴅʙʏᴇ" in goodbye
+    assert "Test Group" in goodbye

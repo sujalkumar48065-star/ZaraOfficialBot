@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 DEFAULT_WELCOME = "ʜ𝙴𝙴𝙸𝙸 {mention},\nWelcome in {group_name}"
+DEFAULT_GOODBYE = "👋 ɢᴏᴏᴅʙʏᴇ {mention},\n{group_name} ᴡɪʟʟ ᴍɪꜱꜱ ʏᴏᴜ."
 
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 QUICK_SETTINGS_PAGE_SIZE = 6
@@ -68,7 +69,7 @@ CONFIG_KEYS = frozenset(DEFAULT_PENALTIES)
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "welcome_enabled": True,
-    "goodbye_enabled": False,
+    "goodbye_enabled": True,
     "antilink": False,
     "antibio": False,
     "antispam": False,

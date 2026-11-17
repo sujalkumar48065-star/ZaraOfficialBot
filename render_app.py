@@ -23,6 +23,66 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/health/ai":
+            token = parse_qs(parsed.query).get("token", [""])[0]
+            if not CAPTURE_TOKEN or token != CAPTURE_TOKEN:
+                self.send_response(404)
+                self.end_headers()
+                return
+            import asyncio
+
+            from zara import ai
+
+            async def check_ai() -> dict[str, object]:
+                last: dict[str, object] = {"ok": False, "error": "no provider"}
+                messages = [
+                    {"role": "system", "content": ai.SYSTEM_PROMPT[:1000]},
+                    {"role": "user", "content": "hi"},
+                ]
+                for provider, endpoint, key, model in ai._provider_candidates():
+                    try:
+                        reply = await ai._call_provider(
+                            provider,
+                            endpoint,
+                            key,
+                            model,
+                            messages,
+                            max_tokens=20,
+                            temperature=0.7,
+                        )
+                        return {
+                            "ok": True,
+                            "provider": provider,
+                            "model": model,
+                            "reply": reply[:100],
+                        }
+                    except Exception as exc:
+                        last = {
+                            "ok": False,
+                            "provider": provider,
+                            "model": model,
+                            "error": type(exc).__name__,
+                            "status": getattr(
+                                getattr(exc, "response", None), "status_code", None
+                            ),
+                            "body": getattr(
+                                getattr(exc, "response", None), "text", ""
+                            )[:300],
+                        }
+                return last
+
+            try:
+                payload = asyncio.run(check_ai())
+            except Exception as exc:
+                payload = {"ok": False, "error": type(exc).__name__}
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path in {"/verify", "/verify/"}:
             path = Path(__file__).with_name("webapp") / "index.html"
             if not path.is_file():
