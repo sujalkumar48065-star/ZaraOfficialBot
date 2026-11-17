@@ -51,8 +51,8 @@ PENALTY_LABELS = {
 DEFAULT_PENALTIES: dict[str, str] = {
     "antilink": "nothing",
     "antibio": "nothing",
-    "antispam": "mute",
-    "antiflood": "mute",
+    "antispam": "nothing",
+    "antiflood": "nothing",
     "antiforward": "nothing",
     "antiinline": "nothing",
     "antimedia": "nothing",

@@ -137,6 +137,7 @@ MASS_MENTION_LIMIT = 5
 LONG_MESSAGE_LIMIT = 1000
 CONFIG_MESSAGE_TTL = 30
 _AUTO_DELETE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
+_ANSWERED_CALLBACKS: set[str] = set()
 VIOLATION_WARNINGS = {
     "antibio": "aapke bio me link hai, pehle link hatao",
     "antilink": "links are not allowed in this group",
@@ -1373,6 +1374,21 @@ async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
     return None
 
 
+async def send_chat_notice(
+    context: ContextTypes.DEFAULT_TYPE, chat: Any, text: str
+) -> None:
+    """Send a group notice without replying to a message that may be deleted."""
+    try:
+        await context.bot.send_message(
+            chat.id, text, parse_mode=ParseMode.HTML
+        )
+    except TelegramError:
+        try:
+            await context.bot.send_message(chat.id, re.sub("<[^>]+>", "", text))
+        except TelegramError:
+            log.info("Could not send group notice in %s", chat.id)
+
+
 async def edit_callback_message(
     query: Any,
     text: str,
@@ -1497,7 +1513,10 @@ async def answer_callback(query: Any, text: str | None = None, show_alert: bool 
     try:
         await query.answer(text, show_alert=show_alert)
     except TelegramError:
-        pass
+        return
+    if len(_ANSWERED_CALLBACKS) > 1000:
+        _ANSWERED_CALLBACKS.clear()
+    _ANSWERED_CALLBACKS.add(str(query.id))
 
 
 async def user_bio_has_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
@@ -5303,9 +5322,8 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.inline_query.answer(results, cache_time=3, is_personal=True)
 
 
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await answer_callback(query)
     if query.data == "explore":
         await edit_callback_message(
             query,
@@ -5382,6 +5400,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         row = STORE.chat(query.message.chat.id, query.message.chat.title or "")
         settings = modcfg.load_settings(row)
         if key == "goodbye_enabled" and not settings.get("goodbye_enabled") and not row["goodbye"]:
+            await answer_callback(
+                query,
+                "⚠️ sᴇᴛ /setgoodbye ғɪʀsᴛ, ᴛʜᴇɴ ᴛᴜʀɴ ɢᴏᴏᴅʙʏᴇ ᴏɴ.",
+                show_alert=True,
+            )
             await edit_config_message(
                 query,
                 modcfg.quick_settings_text(settings, page)
@@ -5681,6 +5704,15 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    try:
+        await _callback_inner(update, context)
+    finally:
+        if query and str(query.id) not in _ANSWERED_CALLBACKS:
+            await answer_callback(query)
+
+
 async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     user = update.effective_user
@@ -5791,17 +5823,22 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except TelegramError:
                 removed = False
             penalty = modcfg.penalty_for(settings, violation)
-            outcome = await apply_penalty(
+            try:
+                outcome = await apply_penalty(
+                    context,
+                    chat,
+                    user.id,
+                    penalty,
+                    settings,
+                    modcfg.PROTECTION_LABELS.get(violation, violation),
+                    text,
+                )
+            except Exception:
+                log.exception("Penalty failed for %s in %s", violation, chat.id)
+                outcome = "action failed"
+            await send_chat_notice(
                 context,
                 chat,
-                user.id,
-                penalty,
-                settings,
-                modcfg.PROTECTION_LABELS.get(violation, violation),
-                text,
-            )
-            await safe_reply(
-                update,
                 violation_warning(
                     violation,
                     user,
@@ -5828,8 +5865,9 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await update.message.delete()
                 except TelegramError:
                     removed = False
-                await safe_reply(
-                    update,
+                await send_chat_notice(
+                    context,
+                    chat,
                     violation_warning("blacklist", user, removed),
                 )
                 return

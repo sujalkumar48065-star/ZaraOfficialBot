@@ -670,6 +670,52 @@ def test_violation_warning_omits_action_line_when_nothing():
 
 
 @pytest.mark.asyncio
+async def test_antilink_sends_public_warning_without_action(store, monkeypatch):
+    settings = modcfg.load_settings(store.chat(-1001, "Test Group"))
+    settings["antilink"] = True
+    settings["penalties"]["antilink"] = "nothing"
+    modcfg.save_settings(store, -1001, settings)
+    monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=False))
+    update, context, message = make_update("https://example.com")
+    update.message = message
+    message.caption = None
+
+    await zara_bot.text_filter(update, context)
+
+    message.delete.assert_awaited_once()
+    sent = context.bot.send_message.await_args.args[1]
+    assert 'href="tg://user?id=1"' in sent
+    assert "ᴀɴᴛɪ-ʟɪɴᴋ" in sent
+    assert "ʟɪɴᴋꜱ ᴀʀᴇ ɴᴏᴛ ᴀʟʟᴏᴡᴇᴅ" in sent
+    assert zara_bot.styled("Action") not in sent
+    context.bot.restrict_chat_member.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_antispam_nothing_penalty_only_warns(store, monkeypatch):
+    settings = modcfg.load_settings(store.chat(-1001, "Test Group"))
+    settings["antispam"] = True
+    settings["penalties"]["antispam"] = "nothing"
+    modcfg.save_settings(store, -1001, settings)
+    monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=False))
+    zara_bot.SPAM_TRACKER.clear()
+    context = None
+    last_message = None
+    for _ in range(3):
+        update, context, last_message = make_update("same spam text")
+        update.message = last_message
+        last_message.caption = None
+        last_message.sticker = None
+        context.bot.username = ""
+        await zara_bot.text_filter(update, context)
+
+    sent = context.bot.send_message.await_args.args[1]
+    assert "ᴀɴᴛɪ-ꜱᴘᴀᴍ" in sent
+    assert "ꜱᴘᴀᴍ ɪꜱ ɴᴏᴛ ᴀʟʟᴏᴡᴇᴅ" in sent
+    context.bot.restrict_chat_member.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_apply_penalty_warn_increments_and_resets_at_limit(store, monkeypatch):
     patch_admin(monkeypatch)
     settings = modcfg.load_settings(store.chat(-1001, "Test Group"))

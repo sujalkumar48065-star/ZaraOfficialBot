@@ -94,7 +94,7 @@ def test_unknown_json_values_fall_back_to_defaults(tmp_path) -> None:
         settings = load_settings(row)
         assert settings["welcome_enabled"] is True
         assert settings["warn_action"] == "mute"
-        assert settings["penalties"]["antispam"] == "mute"
+        assert settings["penalties"]["antispam"] == "nothing"
     finally:
         db.close()
 
@@ -130,7 +130,7 @@ def test_nested_penalties_are_merged_safely(tmp_path) -> None:
         settings = load_settings(db.execute("SELECT * FROM chats WHERE chat_id=?", (-1001,)).fetchone())
         assert settings["antiinline"] is True
         assert settings["penalties"]["antilink"] == "ban"
-        assert settings["penalties"]["antispam"] == "mute"
+        assert settings["penalties"]["antispam"] == "nothing"
         assert "unknown" not in settings["penalties"]
     finally:
         db.close()

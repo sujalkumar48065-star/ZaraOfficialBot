@@ -7,6 +7,7 @@ normal messages and stickers can share one provider, history, and prompt.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import random
@@ -726,22 +727,26 @@ async def generate_reply(
         {"role": "user", "content": text or "(sticker sent)"},
     ]
     last_error: Exception | None = None
-    for provider, endpoint, key, model in providers:
-        try:
-            reply = await _call_provider(
-                provider,
-                endpoint,
-                key,
-                model,
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            if reply:
-                return AIReply(text=reply, provider=provider, model=model)
-        except (httpx.HTTPError, AIError, ValueError, TypeError) as exc:
-            last_error = exc
-            log.warning("%s chat provider failed: %s", provider, type(exc).__name__)
+    for attempt in range(2):
+        for provider, endpoint, key, model in providers:
+            try:
+                reply = await _call_provider(
+                    provider,
+                    endpoint,
+                    key,
+                    model,
+                    messages,
+                    max_tokens=max_tokens if attempt == 0 else max(max_tokens, 180),
+                    temperature=temperature if attempt == 0 else min(temperature, 0.7),
+                )
+                if reply:
+                    return AIReply(text=reply, provider=provider, model=model)
+                last_error = AIError(f"{provider} returned an empty reply")
+            except (httpx.HTTPError, AIError, ValueError, TypeError) as exc:
+                last_error = exc
+                log.warning("%s chat provider failed: %s", provider, type(exc).__name__)
+        if attempt == 0:
+            await asyncio.sleep(0.8)
     if last_error:
         log.warning("All chat providers failed: %s", type(last_error).__name__)
     return None
