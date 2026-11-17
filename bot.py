@@ -152,6 +152,7 @@ VIOLATION_WARNINGS = {
     "anticaps": "too many capital letters, please use normal text",
     "antilong": "your message is too long",
     "antichannel": "channel messages are not allowed in this group",
+    "blacklist": "this word is not allowed in this group",
 }
 
 logging.basicConfig(
@@ -628,31 +629,30 @@ FORMAT_REPLY_COMMANDS = MODERATION_REPLY_COMMANDS | frozenset(
 )
 
 
-def without_pre(text: str) -> str:
-    """Telegram shows a copy-code button for pre; Zara never uses it."""
-    return text.replace("<pre>", "<blockquote>").replace("</pre>", "</blockquote>")
-
-
 def pre_block(value: str) -> str:
-    """Render compact stats without Telegram's copy-code pre block."""
-    return f"<blockquote>{html.escape(value, quote=False)}</blockquote>"
+    """Render compact stats as pre; profiles keep this even if copy appears."""
+    return f"<pre>{html.escape(value, quote=False)}</pre>"
 
 
 def pre_or_quote(value: str, limit: int = PRE_TEXT_MAX) -> str:
-    """Always use blockquote so Telegram never shows the copy-code button."""
+    """Use pre for short one-line replies and blockquote for long/multiline text."""
     plain = html.unescape(re.sub(r"<[^>]+>", "", value))
-    return f"<blockquote>{html.escape(plain, quote=False)}</blockquote>"
+    if "\n" in plain or len(plain) > limit:
+        return f"<blockquote>{html.escape(plain, quote=False)}</blockquote>"
+    return f"<pre>{html.escape(plain, quote=False)}</pre>"
 
 
 def auto_format_reply(text: str) -> str:
-    """Format every plain reply with blockquote; never emit a pre block."""
-    text = without_pre(text)
-    if "<blockquote>" in text.lower():
+    """Format short replies with pre and long/multiline/link replies with quote."""
+    lowered = text.lower()
+    if "<pre>" in lowered or "<blockquote>" in lowered:
         return text
     if re.search(r"<a\b", text, re.IGNORECASE):
         return f"<blockquote>{text}</blockquote>"
     plain = html.unescape(re.sub(r"<[^>]+>", "", text))
-    return f"<blockquote>{html.escape(plain, quote=False)}</blockquote>"
+    if "\n" in plain or len(plain) > PRE_TEXT_MAX:
+        return f"<blockquote>{html.escape(plain, quote=False)}</blockquote>"
+    return f"<pre>{html.escape(plain, quote=False)}</pre>"
 
 
 def message_command(update: Update) -> str:
@@ -755,16 +755,28 @@ def matches_filter_word(text: str, word: str) -> bool:
     return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text.lower()) is not None
 
 
-def violation_warning(violation: str, user: Any, removed: bool = True) -> str:
+def violation_warning(
+    violation: str,
+    user: Any,
+    removed: bool = True,
+    action: str = "nothing",
+    outcome: str = "no action",
+) -> str:
     label = modcfg.PROTECTION_LABELS.get(violation, "protection")
     reason = VIOLATION_WARNINGS.get(
         violation, "this message is not allowed in this group"
     )
     footer = "message removed" if removed else "could not remove message — check my delete rights"
+    action_line = ""
+    if action != "nothing":
+        action_line = (
+            f"\n⚙️ {styled('action')}: <b>{esc(styled(outcome))}</b>"
+        )
     return (
         f"🚫 <b>{styled(label)}</b>\n"
         f"{DIVIDER}\n"
-        f"<blockquote>▫️ {mention(user)}, {styled(reason)}</blockquote>\n"
+        f"<blockquote>▫️ {styled('dear')} {mention_styled(user)}, "
+        f"{styled(reason)}.{action_line}</blockquote>\n"
         f"{DIVIDER}\n"
         f"📌 {styled(footer)}"
     )
@@ -1344,7 +1356,7 @@ def ipv4_async_client(**kwargs: Any) -> httpx.AsyncClient:
 
 
 async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
-    text = auto_format_reply(without_pre(text))
+    text = auto_format_reply(text)
     if update.effective_message:
         try:
             return await update.effective_message.reply_text(
@@ -1368,7 +1380,6 @@ async def edit_callback_message(
     **kwargs: Any,
 ) -> Any:
     """Edit a callback menu, keeping short pages as photo + caption."""
-    text = without_pre(text)
     message = query.message
     if not message:
         return None
@@ -1504,6 +1515,48 @@ async def user_bio_has_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) ->
     return has_link
 
 
+async def perform_penalty_action(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    user_id: int,
+    action: str,
+) -> str:
+    """Apply one concrete ban/mute/kick and return a human-readable outcome."""
+    action = action if action in {"ban", "mute", "kick"} else "nothing"
+    if action == "nothing":
+        return "no action"
+    allowed, reason_text = await bot_admin_check(
+        context, chat, "can_restrict_members"
+    )
+    if not allowed:
+        return f"{action} failed — {re.sub('<[^>]+>', '', reason_text)}"
+    member, error = await target_member(context, chat.id, user_id)
+    if not member:
+        return f"{action} failed — {error.lstrip('❌ ')}"
+    if member.status in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR}:
+        return f"{action} skipped — protected admin"
+    try:
+        if action == "ban":
+            await context.bot.ban_chat_member(chat.id, user_id)
+            return "banned"
+        if action == "mute":
+            await context.bot.restrict_chat_member(
+                chat.id,
+                user_id,
+                ChatPermissions(can_send_messages=False),
+                until_date=now() + 600,
+            )
+            return "muted 10m"
+        await context.bot.ban_chat_member(chat.id, user_id)
+        try:
+            await context.bot.unban_chat_member(chat.id, user_id, only_if_banned=True)
+        except TelegramError:
+            return "kick failed — unban failed"
+        return "kicked"
+    except TelegramError as exc:
+        return f"{action} failed — {type(exc).__name__}"
+
+
 async def apply_penalty(
     context: ContextTypes.DEFAULT_TYPE,
     chat: Any,
@@ -1515,33 +1568,37 @@ async def apply_penalty(
 ) -> str:
     action = action if action in modcfg.PENALTY_CYCLE else "nothing"
     outcome = "no action"
-    if action != "nothing":
-        allowed, reason_text = await bot_admin_check(
-            context, chat, "can_restrict_members"
-        )
-        if not allowed:
-            outcome = f"{action} failed — {re.sub('<[^>]+>', '', reason_text)}"
+    if action == "warn":
+        with STORE.transaction():
+            STORE.db.execute(
+                "INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,1) "
+                "ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1",
+                (chat.id, user_id),
+            )
+            warning = STORE.db.execute(
+                "SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
+                (chat.id, user_id),
+            ).fetchone()
+        count = int(warning["count"])
+        limit = max(1, int(settings.get("warn_limit", 3)))
+        if count < limit:
+            outcome = f"warning {count}/{limit}"
         else:
-            member, error = await target_member(context, chat.id, user_id)
-            if not member:
-                outcome = f"{action} failed — {error.lstrip('❌ ')}"
-            elif member.status in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR}:
-                outcome = f"{action} skipped — protected admin"
-            else:
-                try:
-                    if action == "ban":
-                        await context.bot.ban_chat_member(chat.id, user_id)
-                        outcome = "banned"
-                    elif action == "mute":
-                        await context.bot.restrict_chat_member(
-                            chat.id,
-                            user_id,
-                            ChatPermissions(can_send_messages=False),
-                            until_date=now() + 600,
-                        )
-                        outcome = "muted 10m"
-                except TelegramError as exc:
-                    outcome = f"{action} failed — {type(exc).__name__}"
+            warn_action = str(settings.get("warn_action", "mute"))
+            if warn_action not in {"mute", "kick", "ban"}:
+                warn_action = "mute"
+            sub_outcome = await perform_penalty_action(
+                context, chat, user_id, warn_action
+            )
+            outcome = f"warning {count}/{limit} → {sub_outcome}"
+            if sub_outcome in {"banned", "muted 10m", "kicked"}:
+                STORE.db.execute(
+                    "DELETE FROM warnings WHERE chat_id=? AND user_id=?",
+                    (chat.id, user_id),
+                )
+                STORE.db.commit()
+    elif action != "nothing":
+        outcome = await perform_penalty_action(context, chat, user_id, action)
     suffix = f" → {esc(detail[:200])}" if detail else ""
     await send_mod_log(
         context,
@@ -5733,15 +5790,25 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await message.delete()
             except TelegramError:
                 removed = False
-            await safe_reply(update, violation_warning(violation, user, removed))
-            await apply_penalty(
+            penalty = modcfg.penalty_for(settings, violation)
+            outcome = await apply_penalty(
                 context,
                 chat,
                 user.id,
-                modcfg.penalty_for(settings, violation),
+                penalty,
                 settings,
                 modcfg.PROTECTION_LABELS.get(violation, violation),
                 text,
+            )
+            await safe_reply(
+                update,
+                violation_warning(
+                    violation,
+                    user,
+                    removed,
+                    action=penalty,
+                    outcome=outcome,
+                ),
             )
             return
 
@@ -5756,10 +5823,15 @@ async def text_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ).fetchall()
         for row in blacklisted:
             if matches_filter_word(text, row["word"]):
+                removed = True
                 try:
                     await update.message.delete()
                 except TelegramError:
-                    pass
+                    removed = False
+                await safe_reply(
+                    update,
+                    violation_warning("blacklist", user, removed),
+                )
                 return
     if text:
         for row in STORE.db.execute(

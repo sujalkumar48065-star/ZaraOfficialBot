@@ -41,10 +41,11 @@ def quick_settings_page_items(page: int) -> list[tuple[str, str]]:
     start = page * QUICK_SETTINGS_PAGE_SIZE
     return list(TOGGLE_LABELS[start : start + QUICK_SETTINGS_PAGE_SIZE])
 
-PENALTY_CYCLE: tuple[str, ...] = ("ban", "mute", "nothing")
+PENALTY_CYCLE: tuple[str, ...] = ("ban", "mute", "warn", "nothing")
 PENALTY_LABELS = {
     "ban": "Ban",
     "mute": "Mute",
+    "warn": "Warn",
     "nothing": "Nothing",
 }
 DEFAULT_PENALTIES: dict[str, str] = {
@@ -131,6 +132,7 @@ PROTECTION_LABELS = {
     "antichannel": "Anti-channel",
     "antibot": "Anti-bot",
     "captcha": "Captcha",
+    "blacklist": "Blacklist",
 }
 
 CATEGORIES: dict[str, dict[str, Any]] = {

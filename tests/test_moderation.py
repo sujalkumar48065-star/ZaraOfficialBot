@@ -106,6 +106,7 @@ def test_penalty_cycle_and_status_text(tmp_path) -> None:
         assert penalty_for(settings, "antilink") == "nothing"
         assert cycle_penalty(settings, "antilink") == "ban"
         assert cycle_penalty(settings, "antilink") == "mute"
+        assert cycle_penalty(settings, "antilink") == "warn"
         assert cycle_penalty(settings, "antilink") == "nothing"
         set_penalty(settings, "antispam", "ban")
         assert penalty_for(settings, "antispam") == "ban"

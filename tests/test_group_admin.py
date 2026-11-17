@@ -439,15 +439,13 @@ def test_verification_is_optional_when_channel_not_configured(monkeypatch):
     assert not zara_bot.verification_markup().inline_keyboard
 
 
-def test_all_replies_use_blockquote_and_never_pre():
+def test_short_replies_use_pre_and_long_use_blockquote():
     short = zara_bot.pre_or_quote("short reply")
     long_text = "x" * (zara_bot.PRE_TEXT_MAX + 1)
     long_reply = zara_bot.pre_or_quote(long_text)
 
-    assert short.startswith("<blockquote>")
+    assert short == "<pre>short reply</pre>"
     assert long_reply.startswith("<blockquote>")
-    assert "<pre>" not in short
-    assert "<pre>" not in long_reply
 
 
 def test_leaderboard_is_blockquoted_and_has_no_buttons():
@@ -466,17 +464,17 @@ def test_styled_mentions_keep_links_and_small_caps(store):
     assert zara_bot.styled("Styled User") in text
 
 
-def test_profile_and_start_stats_use_blockquote_formatting(store):
+def test_profile_and_start_stats_use_pre_formatting(store):
     user = SimpleNamespace(id=704, username="pre", full_name="Pre User", is_bot=False)
     row = store.user(user)
 
     profile = zara_bot.profile_text(row, user.id)
     start = zara_bot.start_message(user, row)
 
-    assert profile.startswith("<blockquote>")
+    assert profile.startswith("<pre>")
+    assert profile.endswith("</pre>")
     assert "ʙᴀʟᴀɴᴄᴇ" in profile
-    assert "<blockquote>" in start
-    assert "<pre>" not in start
+    assert "<pre>" in start
     assert "ʙᴀʟᴀɴᴄᴇ" in start
 
 
@@ -572,13 +570,24 @@ async def test_rob_creates_actor_row_before_crediting(store, monkeypatch):
     assert actor["balance"] > 0
 
 @pytest.mark.asyncio
-async def test_safe_reply_formats_plain_short_text_as_blockquote():
+async def test_safe_reply_formats_plain_short_text_as_pre():
     update, _, message = make_update("/anything")
 
     await zara_bot.safe_reply(update, "reply to someone to slap them")
 
     sent = message.reply_text.await_args.args[0]
-    assert sent == "<blockquote>reply to someone to slap them</blockquote>"
+    assert sent == "<pre>reply to someone to slap them</pre>"
+
+
+@pytest.mark.asyncio
+async def test_safe_reply_formats_long_text_as_blockquote():
+    update, _, message = make_update("/anything")
+    long_text = "x" * (zara_bot.PRE_TEXT_MAX + 1)
+
+    await zara_bot.safe_reply(update, long_text)
+
+    sent = message.reply_text.await_args.args[0]
+    assert sent.startswith("<blockquote>")
     assert "<pre>" not in sent
 
 
@@ -630,14 +639,58 @@ async def test_ban_success_uses_blockquote_and_clickable_target(store, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_safe_reply_strips_inline_tags_without_pre():
+async def test_safe_reply_strips_inline_tags_in_short_pre():
     update, _, message = make_update("/anything")
 
     await zara_bot.safe_reply(update, "📌 ᴘɪɴɴᴇᴅ <code>123</code>")
 
     sent = message.reply_text.await_args.args[0]
-    assert sent == "<blockquote>📌 ᴘɪɴɴᴇᴅ 123</blockquote>"
-    assert "<pre>" not in sent
+    assert sent == "<pre>📌 ᴘɪɴɴᴇᴅ 123</pre>"
+
+
+def test_violation_warning_shows_clickable_user_and_action():
+    user = SimpleNamespace(id=704, full_name="Rule Breaker", is_bot=False)
+
+    text = zara_bot.violation_warning(
+        "antilink", user, True, action="warn", outcome="warning 1/3"
+    )
+
+    assert 'href="tg://user?id=704"' in text
+    assert zara_bot.styled("Action") in text
+    assert "𝟷/𝟹" in text
+    assert "ʟɪɴᴋꜱ ᴀʀᴇ ɴᴏᴛ ᴀʟʟᴏᴡᴇᴅ" in text
+
+
+def test_violation_warning_omits_action_line_when_nothing():
+    user = SimpleNamespace(id=704, full_name="Rule Breaker", is_bot=False)
+
+    text = zara_bot.violation_warning("antimedia", user, True)
+
+    assert zara_bot.styled("Action") not in text
+
+
+@pytest.mark.asyncio
+async def test_apply_penalty_warn_increments_and_resets_at_limit(store, monkeypatch):
+    patch_admin(monkeypatch)
+    settings = modcfg.load_settings(store.chat(-1001, "Test Group"))
+    settings["warn_limit"] = 1
+    settings["warn_action"] = "mute"
+    modcfg.save_settings(store, -1001, settings)
+    update, context, _ = make_update("/warn 12345", ["12345"])
+    chat = update.effective_chat
+
+    outcome = await zara_bot.apply_penalty(
+        context, chat, 12345, "warn", settings, "Anti-link"
+    )
+
+    assert "warning 1/1" in outcome
+    assert "muted 10m" in outcome
+    context.bot.restrict_chat_member.assert_awaited_once()
+    row = store.db.execute(
+        "SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
+        (-1001, 12345),
+    ).fetchone()
+    assert row is None
 
 
 @pytest.mark.asyncio
