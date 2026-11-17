@@ -439,10 +439,15 @@ def test_verification_is_optional_when_channel_not_configured(monkeypatch):
     assert not zara_bot.verification_markup().inline_keyboard
 
 
-def test_short_replies_use_pre_and_long_replies_fall_back_to_blockquote():
-    assert zara_bot.pre_or_quote("short reply").startswith("<pre>")
+def test_all_replies_use_blockquote_and_never_pre():
+    short = zara_bot.pre_or_quote("short reply")
     long_text = "x" * (zara_bot.PRE_TEXT_MAX + 1)
-    assert zara_bot.pre_or_quote(long_text).startswith("<blockquote>")
+    long_reply = zara_bot.pre_or_quote(long_text)
+
+    assert short.startswith("<blockquote>")
+    assert long_reply.startswith("<blockquote>")
+    assert "<pre>" not in short
+    assert "<pre>" not in long_reply
 
 
 def test_leaderboard_is_blockquoted_and_has_no_buttons():
@@ -461,16 +466,17 @@ def test_styled_mentions_keep_links_and_small_caps(store):
     assert zara_bot.styled("Styled User") in text
 
 
-def test_profile_and_start_stats_use_pre_formatting(store):
+def test_profile_and_start_stats_use_blockquote_formatting(store):
     user = SimpleNamespace(id=704, username="pre", full_name="Pre User", is_bot=False)
     row = store.user(user)
 
     profile = zara_bot.profile_text(row, user.id)
     start = zara_bot.start_message(user, row)
 
-    assert profile.startswith("<pre>")
+    assert profile.startswith("<blockquote>")
     assert "ʙᴀʟᴀɴᴄᴇ" in profile
-    assert "<pre>" in start
+    assert "<blockquote>" in start
+    assert "<pre>" not in start
     assert "ʙᴀʟᴀɴᴄᴇ" in start
 
 
@@ -566,12 +572,14 @@ async def test_rob_creates_actor_row_before_crediting(store, monkeypatch):
     assert actor["balance"] > 0
 
 @pytest.mark.asyncio
-async def test_safe_reply_formats_plain_short_text_as_pre():
+async def test_safe_reply_formats_plain_short_text_as_blockquote():
     update, _, message = make_update("/anything")
 
     await zara_bot.safe_reply(update, "reply to someone to slap them")
 
-    assert message.reply_text.await_args.args[0] == "<pre>reply to someone to slap them</pre>"
+    sent = message.reply_text.await_args.args[0]
+    assert sent == "<blockquote>reply to someone to slap them</blockquote>"
+    assert "<pre>" not in sent
 
 
 @pytest.mark.asyncio
@@ -622,12 +630,14 @@ async def test_ban_success_uses_blockquote_and_clickable_target(store, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_safe_reply_strips_inline_tags_for_short_pre_text():
+async def test_safe_reply_strips_inline_tags_without_pre():
     update, _, message = make_update("/anything")
 
     await zara_bot.safe_reply(update, "📌 ᴘɪɴɴᴇᴅ <code>123</code>")
 
-    assert message.reply_text.await_args.args[0] == "<pre>📌 ᴘɪɴɴᴇᴅ 123</pre>"
+    sent = message.reply_text.await_args.args[0]
+    assert sent == "<blockquote>📌 ᴘɪɴɴᴇᴅ 123</blockquote>"
+    assert "<pre>" not in sent
 
 
 @pytest.mark.asyncio

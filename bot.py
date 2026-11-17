@@ -628,28 +628,31 @@ FORMAT_REPLY_COMMANDS = MODERATION_REPLY_COMMANDS | frozenset(
 )
 
 
+def without_pre(text: str) -> str:
+    """Telegram shows a copy-code button for pre; Zara never uses it."""
+    return text.replace("<pre>", "<blockquote>").replace("</pre>", "</blockquote>")
+
+
 def pre_block(value: str) -> str:
-    """Always render text as a monospace pre block."""
-    return f"<pre>{html.escape(value, quote=False)}</pre>"
+    """Render compact stats without Telegram's copy-code pre block."""
+    return f"<blockquote>{html.escape(value, quote=False)}</blockquote>"
 
 
 def pre_or_quote(value: str, limit: int = PRE_TEXT_MAX) -> str:
-    """Use pre for short replies, blockquote as the long-text fallback."""
+    """Always use blockquote so Telegram never shows the copy-code button."""
     plain = html.unescape(re.sub(r"<[^>]+>", "", value))
-    safe = html.escape(plain, quote=False)
-    if len(plain) > limit or plain.count("\n") > 1:
-        return f"<blockquote>{safe}</blockquote>"
-    return f"<pre>{safe}</pre>"
+    return f"<blockquote>{html.escape(plain, quote=False)}</blockquote>"
 
 
 def auto_format_reply(text: str) -> str:
-    """Format every plain reply; never double-wrap an existing design."""
-    lowered = text.lower()
-    if "<pre>" in lowered or "<blockquote>" in lowered:
+    """Format every plain reply with blockquote; never emit a pre block."""
+    text = without_pre(text)
+    if "<blockquote>" in text.lower():
         return text
     if re.search(r"<a\b", text, re.IGNORECASE):
         return f"<blockquote>{text}</blockquote>"
-    return pre_or_quote(text)
+    plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+    return f"<blockquote>{html.escape(plain, quote=False)}</blockquote>"
 
 
 def message_command(update: Update) -> str:
@@ -1341,7 +1344,7 @@ def ipv4_async_client(**kwargs: Any) -> httpx.AsyncClient:
 
 
 async def safe_reply(update: Update, text: str, **kwargs: Any) -> Any:
-    text = auto_format_reply(text)
+    text = auto_format_reply(without_pre(text))
     if update.effective_message:
         try:
             return await update.effective_message.reply_text(
@@ -1365,6 +1368,7 @@ async def edit_callback_message(
     **kwargs: Any,
 ) -> Any:
     """Edit a callback menu, keeping short pages as photo + caption."""
+    text = without_pre(text)
     message = query.message
     if not message:
         return None
