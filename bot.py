@@ -3915,21 +3915,25 @@ async def giphy_animation(command: str) -> io.BytesIO | None:
 
 
 async def capture_owner_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only DM capture for replacing bundled action animations."""
-    if not owner(update.effective_user.id):
-        return
+    """Temporary DM capture for replacing bundled action animations."""
     message = update.effective_message
-    if not message:
+    user = update.effective_user
+    if not message or not user:
         return
     media = (
         getattr(message, "animation", None)
         or getattr(message, "video", None)
         or getattr(message, "document", None)
     )
+    caption = (getattr(message, "caption", None) or "").strip().lower()
+    words = re.findall(r"[a-z]+", caption)
+    command = next((word for word in words if word in ACTION_NAMES), "")
     log.info(
-        "Owner DM: text=%s caption=%r animation=%s video=%s document=%s sticker=%s",
+        "Private DM user=%s text=%s caption=%r command=%s animation=%s video=%s document=%s sticker=%s",
+        user.id,
         bool(getattr(message, "text", None)),
-        getattr(message, "caption", None),
+        caption,
+        command,
         bool(getattr(message, "animation", None)),
         bool(getattr(message, "video", None)),
         bool(getattr(message, "document", None)),
@@ -3937,12 +3941,14 @@ async def capture_owner_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     if not media:
         return
-    caption = (message.caption or "").strip().lower()
-    command = caption.split()[0].lstrip("/") if caption else ""
+    if not command and not owner(user.id):
+        return
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    if len(list(CAPTURE_DIR.iterdir())) >= 20:
+        return
     mime = (getattr(media, "mime_type", "") or "").lower()
     extension = ".gif" if "gif" in mime else ".mp4"
-    name = command if command in ACTION_NAMES else f"incoming-{message.message_id}"
-    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    name = command or f"incoming-{user.id}-{message.message_id}"
     path = CAPTURE_DIR / f"{name}{extension}"
     try:
         telegram_file = await context.bot.get_file(media.file_id)
@@ -5816,10 +5822,7 @@ def add_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_members))
     app.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & filters.User(OWNER_ID),
-            capture_owner_gif,
-        )
+        MessageHandler(filters.ChatType.PRIVATE, capture_owner_gif)
     )
     app.add_handler(
         MessageHandler(
