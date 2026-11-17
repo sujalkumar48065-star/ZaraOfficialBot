@@ -3720,6 +3720,7 @@ GIF_ASSETS: dict[str, tuple[Path, ...]] = {
     name: tuple(sorted((ROOT / "assets" / "gifs").glob(f"{name}-*.gif")))
     for name in GIF_ASSET_NAMES
 }
+CAPTURE_DIR = Path(os.getenv("ZARA_CAPTURE_DIR", "/tmp/zara_gif_capture"))
 
 
 GIPHY_QUERY: dict[str, str] = {
@@ -3911,6 +3912,41 @@ async def giphy_animation(command: str) -> io.BytesIO | None:
     except (httpx.HTTPError, TypeError, ValueError) as exc:
         log.info("GIPHY request unavailable for %s: %s", command, type(exc).__name__)
     return None
+
+
+async def capture_owner_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only DM capture for replacing bundled action animations."""
+    if not owner(update.effective_user.id):
+        return
+    message = update.effective_message
+    if not message:
+        return
+    caption = (message.caption or "").strip().lower()
+    command = caption.split()[0].lstrip("/") if caption else ""
+    if command not in ACTION_NAMES:
+        await safe_reply(
+            update,
+            "sᴇɴᴅ ᴀ ɢɪғ ᴡɪᴛʜ ᴄᴀᴘᴛɪᴏɴ: " + ", ".join(ACTION_NAMES),
+        )
+        return
+    media = message.animation or message.video or message.document
+    if not media:
+        return
+    mime = (getattr(media, "mime_type", "") or "").lower()
+    extension = ".gif" if "gif" in mime else ".mp4"
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CAPTURE_DIR / f"{command}{extension}"
+    try:
+        telegram_file = await context.bot.get_file(media.file_id)
+        await telegram_file.download_to_drive(custom_path=path)
+    except TelegramError as exc:
+        log.warning("GIF capture failed for %s: %s", command, type(exc).__name__)
+        await safe_reply(update, f"❌ ғᴀɪʟᴇᴅ ᴛᴏ sᴀᴠᴇ {command}.")
+        return
+    await safe_reply(
+        update,
+        f"✅ sᴀᴠᴇᴅ {command}{extension} ({path.stat().st_size:,} ʙʏᴛᴇs).",
+    )
 
 
 async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5771,6 +5807,14 @@ def add_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, web_app_verify))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_members))
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.User(OWNER_ID)
+            & (filters.ANIMATION | filters.VIDEO | filters.Document.ALL),
+            capture_owner_gif,
+        )
+    )
     app.add_handler(
         MessageHandler(
             filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
