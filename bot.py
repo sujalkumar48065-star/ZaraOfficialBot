@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl
 
 import httpx
 from zara import ai as zara_ai
+from zara import cloud as zara_cloud
 from zara import config as app_config
 from zara import moderation as modcfg
 from zara import tools as zara_tools
@@ -2126,9 +2127,27 @@ async def self_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("Self-ping failed: %s", exc)
 
 
+async def cloud_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not zara_cloud.ready():
+        restored = await zara_cloud.restore(context.bot, STORE.db)
+        log.info("Cloud database retry restore: %s", restored)
+    result = await zara_cloud.save(context.bot, STORE.db)
+    if result.get("status") == "saved":
+        log.info("Cloud database synced: %s", result)
+
+
+async def post_shutdown(application: Application) -> None:
+    result = await zara_cloud.save(application.bot, STORE.db)
+    log.info("Cloud database shutdown sync: %s", result)
+
+
 async def post_init(application: Application) -> None:
     bot = application.bot
     me = await bot.get_me()
+    cloud_result = await zara_cloud.restore(bot, STORE.db)
+    log.info("Cloud database startup restore: %s", cloud_result)
+    if cloud_result.get("status") == "empty":
+        await zara_cloud.save(bot, STORE.db)
     public_commands = [
         ("start", "open the Zara main menu"),
         ("help", "see all commands"),
@@ -2303,6 +2322,18 @@ async def post_init(application: Application) -> None:
     else:
         log.info(
             "Self-ping disabled; set ZARA_SELF_PING_URL or ZARA_WEB_URL when the web URL is ready"
+        )
+    if zara_cloud.enabled() and application.job_queue is not None:
+        application.job_queue.run_repeating(
+            cloud_sync_job,
+            interval=zara_cloud.SYNC_INTERVAL,
+            first=zara_cloud.SYNC_INTERVAL,
+            name="zara-cloud-db",
+        )
+        log.info(
+            "Cloud database sync enabled for channel %s every %ss",
+            zara_cloud.CHANNEL_ID,
+            zara_cloud.SYNC_INTERVAL,
         )
     log.info("Zara started as @%s", me.username)
 
@@ -4108,6 +4139,40 @@ GIPHY_RECENT_IDS: dict[str, deque[str]] = {}
 
 
 ACTION_NAMES = tuple(GIPHY_QUERY)
+ACTION_CAPTION_ALIASES: dict[str, str] = {
+    **{name: name for name in ACTION_NAMES},
+    "high five": "highfive",
+    "highfive": "highfive",
+    "high5": "highfive",
+    "hi five": "highfive",
+    "hi5": "highfive",
+    "high fi": "highfive",
+    "highfi": "highfive",
+    "head pat": "pat",
+    "headpat": "pat",
+}
+
+
+def action_from_caption(caption: str) -> str | None:
+    text = (caption or "").strip().lower()
+    if not text:
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "", text)
+    aliases = {
+        re.sub(r"[^a-z0-9]+", "", alias): command
+        for alias, command in ACTION_CAPTION_ALIASES.items()
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    for alias, command in aliases.items():
+        if len(alias) >= 4 and alias in normalized:
+            return command
+    words = re.findall(r"[a-z0-9]+", text)
+    if "high" in words and ("five" in words or "5" in words):
+        return "highfive"
+    if "head" in words and "pat" in words:
+        return "pat"
+    return None
 
 
 async def giphy_search(command: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -4217,6 +4282,72 @@ async def giphy_animation(command: str) -> io.BytesIO | None:
     except (httpx.HTTPError, TypeError, ValueError) as exc:
         log.info("GIPHY request unavailable for %s: %s", command, type(exc).__name__)
     return None
+
+
+_CHANNEL_LAST_MEDIA: dict[int, tuple[float, int, str]] = {}
+
+
+def channel_media_file_id(message: Any) -> str | None:
+    if message is None:
+        return None
+    for attribute in ("animation", "video", "document"):
+        media = getattr(message, attribute, None)
+        file_id = getattr(media, "file_id", None)
+        if file_id:
+            return str(file_id)
+    return None
+
+
+def remember_channel_media(message: Any) -> None:
+    file_id = channel_media_file_id(message)
+    if not file_id:
+        return
+    chat_id = int(getattr(message, "chat_id", 0) or 0)
+    if chat_id:
+        _CHANNEL_LAST_MEDIA[chat_id] = (
+            time.monotonic(),
+            int(getattr(message, "message_id", 0) or 0),
+            file_id,
+        )
+
+
+async def channel_gif_capture(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.channel_post
+    if not message or int(getattr(message, "chat_id", 0) or 0) != zara_cloud.CHANNEL_ID:
+        return
+    if not channel_media_file_id(message):
+        return
+    document = getattr(message, "document", None)
+    file_name = getattr(document, "file_name", "") or ""
+    caption = getattr(message, "caption", "") or ""
+    if file_name.startswith(zara_cloud.SNAPSHOT_PREFIX) or zara_cloud.SNAPSHOT_MARKER in caption:
+        return
+    remember_channel_media(message)
+    command = action_from_caption(getattr(message, "caption", "") or "")
+    if not command:
+        return
+    file_id = channel_media_file_id(message)
+    STORE.db.set_meta(f"action_gif:{command}", file_id)
+    log.info("Channel action GIF saved for /%s", command)
+
+
+async def channel_caption_capture(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.channel_post
+    if not message or int(getattr(message, "chat_id", 0) or 0) != zara_cloud.CHANNEL_ID:
+        return
+    command = action_from_caption(getattr(message, "text", "") or "")
+    if not command:
+        return
+    file_id = channel_media_file_id(getattr(message, "reply_to_message", None))
+    if not file_id:
+        last = _CHANNEL_LAST_MEDIA.get(int(message.chat_id))
+        if last and time.monotonic() - last[0] <= 600:
+            file_id = last[2]
+    if not file_id:
+        log.info("Channel caption /%s found, but no recent GIF was available", command)
+        return
+    STORE.db.set_meta(f"action_gif:{command}", file_id)
+    log.info("Channel action GIF saved for /%s from caption", command)
 
 
 async def capture_owner_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4384,7 +4515,24 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + "</blockquote>"
     )
 
-    # Prefer the configured GIPHY source, then use the bundled animations.
+    # Prefer the GIF uploaded to the Zara database channel, then GIPHY,
+    # then the bundled animations.
+    channel_gif = STORE.db.get_meta(f"action_gif:{command}")
+    if channel_gif:
+        try:
+            await update.effective_message.reply_animation(
+                channel_gif, caption=caption, parse_mode=ParseMode.HTML
+            )
+            STORE.db.execute(
+                "INSERT INTO action_counters(action,count) VALUES(?,1) "
+                "ON CONFLICT(action) DO UPDATE SET count=count+1",
+                (command,),
+            )
+            STORE.db.commit()
+            return
+        except TelegramError as exc:
+            log.warning("Channel GIF failed for %s: %s", command, exc)
+
     giphy = await giphy_animation(command)
     if giphy:
         try:
@@ -6192,6 +6340,19 @@ def add_handlers(app: Application) -> None:
     )
     app.add_handler(
         MessageHandler(
+            filters.ChatType.CHANNEL
+            & (filters.ANIMATION | filters.VIDEO | filters.Document.ALL),
+            channel_gif_capture,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.CHANNEL & filters.TEXT & ~filters.COMMAND,
+            channel_caption_capture,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
             filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
             text_filter,
         )
@@ -6217,6 +6378,7 @@ def main() -> None:
         .token(token)
         .request(request)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
     add_handlers(application)
