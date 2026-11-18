@@ -851,6 +851,91 @@ def render_template(template: str, user: Any, chat: Any) -> str:
     return rendered
 
 
+def template_from_message(message: Any) -> tuple[str, dict[str, str] | None]:
+    """Capture a replied message as exact welcome/goodbye content."""
+    if message is None:
+        return "", None
+    media: dict[str, str] | None = None
+    sticker = getattr(message, "sticker", None)
+    photo = getattr(message, "photo", None)
+    video = getattr(message, "video", None)
+    animation = getattr(message, "animation", None)
+    document = getattr(message, "document", None)
+    if sticker is not None:
+        media = {"type": "sticker", "file_id": sticker.file_id}
+    elif photo:
+        media = {"type": "photo", "file_id": photo[-1].file_id}
+    elif video is not None:
+        media = {"type": "video", "file_id": video.file_id}
+    elif animation is not None:
+        media = {"type": "animation", "file_id": animation.file_id}
+    elif document is not None:
+        media = {"type": "document", "file_id": document.file_id}
+
+    text_html = getattr(message, "text_html", None)
+    if text_html is None:
+        text_html = getattr(message, "caption_html", None)
+    if text_html is None:
+        raw = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        text_html = html.escape(str(raw), quote=False)
+    return str(text_html), media
+
+
+async def send_template_notice(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    text: str,
+    media: dict[str, str] | None = None,
+) -> bool:
+    """Send exact welcome/goodbye text, with optional replied media."""
+    if not media:
+        return await send_chat_notice(context, chat, text) if text else True
+
+    kind = str(media.get("type") or "")
+    file_id = str(media.get("file_id") or "")
+    if not file_id:
+        return await send_chat_notice(context, chat, text) if text else False
+
+    if kind == "sticker":
+        try:
+            await context.bot.send_sticker(chat.id, file_id)
+        except RetryAfter as exc:
+            log.warning("Telegram flood control for sticker notice: %ss", exc.retry_after)
+            return False
+        except TelegramError as exc:
+            log.warning("Sticker notice failed: %s", type(exc).__name__)
+            return await send_chat_notice(context, chat, text) if text else False
+        if text:
+            return await send_chat_notice(context, chat, text)
+        return True
+
+    method = getattr(context.bot, f"send_{kind}", None)
+    if method is None:
+        return await send_chat_notice(context, chat, text) if text else False
+
+    caption = text if text and len(text) <= 1024 else None
+    for use_html in (True, False):
+        kwargs: dict[str, Any] = {}
+        if caption:
+            kwargs["caption"] = (
+                caption if use_html else re.sub("<[^>]+>", "", caption)
+            )
+            if use_html:
+                kwargs["parse_mode"] = ParseMode.HTML
+        try:
+            await method(chat.id, file_id, **kwargs)
+            if text and len(text) > 1024:
+                await send_chat_notice(context, chat, text)
+            return True
+        except RetryAfter as exc:
+            log.warning("Telegram flood control for %s notice: %ss", kind, exc.retry_after)
+            return False
+        except TelegramError as exc:
+            log.warning("%s notice failed: %s", kind, type(exc).__name__)
+            continue
+    return await send_chat_notice(context, chat, text) if text else False
+
+
 def pair_value(first_id: int, second_id: int) -> int:
     """Stable, pair-specific relationship value in a friendly 50–100 range."""
     low, high = sorted((int(first_id), int(second_id)))
@@ -1390,16 +1475,16 @@ async def send_chat_notice(
     chat: Any,
     text: str,
     **kwargs: Any,
-) -> None:
+) -> bool:
     """Send a group notice without replying to a message that may be deleted."""
     send_kwargs = dict(kwargs)
     send_kwargs.setdefault("parse_mode", ParseMode.HTML)
     try:
         await context.bot.send_message(chat.id, text, **send_kwargs)
-        return
+        return True
     except RetryAfter as exc:
         log.warning("Telegram flood control in group notice: %ss", exc.retry_after)
-        return
+        return False
     except TelegramError:
         pass
     plain_kwargs = {k: v for k, v in kwargs.items() if k != "parse_mode"}
@@ -1407,6 +1492,7 @@ async def send_chat_notice(
         await context.bot.send_message(
             chat.id, re.sub("<[^>]+>", "", text), **plain_kwargs
         )
+        return True
     except RetryAfter as exc:
         log.warning(
             "Telegram flood control in group notice fallback: %ss",
@@ -1414,6 +1500,7 @@ async def send_chat_notice(
         )
     except TelegramError:
         log.info("Could not send group notice in %s", chat.id)
+    return False
 
 
 async def edit_callback_message(
@@ -2278,14 +2365,23 @@ async def send_welcome(
 ) -> None:
     if not settings.get("welcome_enabled"):
         return
-    template = row["welcome"] or modcfg.DEFAULT_WELCOME
+    media = settings.get("welcome_media")
+    if not isinstance(media, dict):
+        media = None
+    template = row["welcome"] or ("" if media else modcfg.DEFAULT_WELCOME)
     text = render_template(template, new_user, chat)
-    await send_chat_notice(context, chat, text)
-    log.info("Welcome sent for %s in %s", new_user.id, chat.id)
+    sent = await send_template_notice(context, chat, text, media)
+    if sent:
+        log.info("Welcome sent for %s in %s (media=%s)", new_user.id, chat.id, bool(media))
+    else:
+        log.warning("Welcome could not be sent for %s in %s", new_user.id, chat.id)
 
 
 async def process_join(
-    context: ContextTypes.DEFAULT_TYPE, chat: Any, new_user: Any
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    new_user: Any,
+    source: str = "new_chat_members",
 ) -> None:
     if not chat or not new_user:
         return
@@ -2293,37 +2389,22 @@ async def process_join(
         return
     row = STORE.chat(chat.id, chat.title or "")
     settings = modcfg.load_settings(row)
+    log.info(
+        "Join event (%s) for %s in %s; welcome=%s",
+        source,
+        new_user.id,
+        chat.id,
+        settings.get("welcome_enabled"),
+    )
 
     if new_user.is_bot:
         if new_user.id == context.bot.id:
             await send_chat_notice(
                 context,
                 chat,
-                "🃏 <b>ʜɪɪɪ, ᴛʜᴀɴᴋ ʏᴏᴜ ғᴏʀ ᴀᴅᴅɪɴɢ ᴢᴀʀᴀ!</b>\n\n"
-                "<blockquote>"
-                f"▫️ {styled('Card game')}: /bet 2000 → /card → /flip a\n"
-                f"🔹 {styled('Economy')}: /bal • /daily • /leaderboard\n"
-                f"▪️ {styled('Group tools')}: /rules • /welcome • /admins"
-                "</blockquote>\n\n"
-                f"📢 ᴜᴘᴅᴀᴛᴇs: {UPDATE_CHANNEL_LABEL}\n"
-                f"💬 sᴜᴘᴘᴏʀᴛ: @{SUPPORT_USERNAME}\n"
-                "ᴜsᴇ /help ғᴏʀ ᴛʜᴇ ᴄᴏᴍᴘʟᴇᴛᴇ ᴍᴇɴᴜ.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[
-                        InlineKeyboardButton(
-                            "➕ ᴏᴘᴇɴ ᴢᴀʀᴀ",
-                            url=(
-                                "https://t.me/"
-                                f"{context.application.bot_data.get('username', 'ZaraBot')}"
-                            ),
-                        ),
-                        *(
-                            [InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇs", url=UPDATE_CHANNEL_URL)]
-                            if UPDATE_CHANNEL_URL
-                            else []
-                        ),
-                    ]]
-                ),
+                "🃏 <b>ᴛʜᴀɴᴋ ʏᴏᴜ ғᴏʀ ᴀᴅᴅɪɴɢ ᴢᴀʀᴀ!</b>\n"
+                "<blockquote>ɴɪᴄᴇ ᴛᴏ ᴍᴇᴇᴛ ʏᴏᴜ ᴀʟʟ. "
+                "ᴇxᴘʟᴏʀᴇ ᴍᴇ ᴡɪᴛʜ /help.</blockquote>",
             )
             return
         if settings.get("antibot"):
@@ -2424,7 +2505,10 @@ async def process_join(
 
 
 async def process_leave(
-    context: ContextTypes.DEFAULT_TYPE, chat: Any, left_user: Any
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: Any,
+    left_user: Any,
+    source: str = "left_chat_member",
 ) -> None:
     if not chat or not left_user or left_user.is_bot:
         return
@@ -2432,6 +2516,13 @@ async def process_leave(
         return
     row = STORE.chat(chat.id, chat.title or "")
     settings = modcfg.load_settings(row)
+    log.info(
+        "Leave event (%s) for %s in %s; goodbye=%s",
+        source,
+        left_user.id,
+        chat.id,
+        settings.get("goodbye_enabled"),
+    )
     await send_mod_log(
         context,
         chat,
@@ -2440,10 +2531,16 @@ async def process_leave(
     )
     if not settings.get("goodbye_enabled"):
         return
-    template = row["goodbye"] or modcfg.DEFAULT_GOODBYE
+    media = settings.get("goodbye_media")
+    if not isinstance(media, dict):
+        media = None
+    template = row["goodbye"] or ("" if media else modcfg.DEFAULT_GOODBYE)
     goodbye = render_template(template, left_user, chat)
-    await send_chat_notice(context, chat, goodbye)
-    log.info("Goodbye sent for %s in %s", left_user.id, chat.id)
+    sent = await send_template_notice(context, chat, goodbye, media)
+    if sent:
+        log.info("Goodbye sent for %s in %s (media=%s)", left_user.id, chat.id, bool(media))
+    else:
+        log.warning("Goodbye could not be sent for %s in %s", left_user.id, chat.id)
 
 
 async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2451,14 +2548,17 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     chat = update.effective_chat
     for new_user in update.message.new_chat_members:
-        await process_join(context, chat, new_user)
+        await process_join(context, chat, new_user, source="new_chat_members")
 
 
 async def goodbye_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.left_chat_member:
         return
     await process_leave(
-        context, update.effective_chat, update.message.left_chat_member
+        context,
+        update.effective_chat,
+        update.message.left_chat_member,
+        source="left_chat_member",
     )
 
 
@@ -2481,9 +2581,13 @@ async def chat_member_update(
         ChatMemberStatus.RESTRICTED,
     }
     if old in left_statuses and new in active_statuses:
-        await process_join(context, event.chat, event.new_chat_member.user)
+        await process_join(
+            context, event.chat, event.new_chat_member.user, source="chat_member"
+        )
     elif old in active_statuses and new in left_statuses:
-        await process_leave(context, event.chat, event.new_chat_member.user)
+        await process_leave(
+            context, event.chat, event.new_chat_member.user, source="chat_member"
+        )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2590,20 +2694,37 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not settings.get("welcome_enabled"):
             await safe_reply(update, "👋 ᴡᴇʟᴄᴏᴍᴇ ɪs ᴏғғ. ᴜsᴇ /quicksettings ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.")
             return
-        template = row["welcome"] or modcfg.DEFAULT_WELCOME
-        label = "ᴄᴜsᴛᴏᴍ" if row["welcome"] else "ᴅᴇғᴀᴜʟᴛ"
-        await safe_reply(update, f"👋 <b>ᴀᴄᴛɪᴠᴇ ᴡᴇʟᴄᴏᴍᴇ ({label})</b>\n<code>{esc(template)}</code>")
+        media = settings.get("welcome_media")
+        media = media if isinstance(media, dict) else None
+        template = row["welcome"] or ("" if media else modcfg.DEFAULT_WELCOME)
+        label = "ᴄᴜsᴛᴏᴍ" if row["welcome"] or media else "ᴅᴇғᴀᴜʟᴛ"
+        preview = template or f"[{media.get('type', 'media')} media]"
+        note = f"\n📎 {media['type']} attached" if media else ""
+        await safe_reply(
+            update,
+            f"👋 <b>ᴀᴄᴛɪᴠᴇ ᴡᴇʟᴄᴏᴍᴇ ({label})</b>\n"
+            f"<code>{esc(preview)}</code>{note}",
+        )
         return
     if command == "goodbye":
-        template = row["goodbye"] or modcfg.DEFAULT_GOODBYE
-        label = "ᴄᴜsᴛᴏᴍ" if row["goodbye"] else "ᴅᴇғᴀᴜʟᴛ"
+        media = settings.get("goodbye_media")
+        media = media if isinstance(media, dict) else None
+        template = row["goodbye"] or ("" if media else modcfg.DEFAULT_GOODBYE)
+        label = "ᴄᴜsᴛᴏᴍ" if row["goodbye"] or media else "ᴅᴇғᴀᴜʟᴛ"
+        preview = template or f"[{media.get('type', 'media')} media]"
+        note = f"\n📎 {media['type']} attached" if media else ""
         if not settings.get("goodbye_enabled"):
             await safe_reply(
                 update,
-                f"👋 <b>ɢᴏᴏᴅʙʏᴇ ɪs ᴏғғ ({label})</b>\n<code>{esc(template)}</code>\n\nᴜsᴇ /quicksettings ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.",
+                f"👋 <b>ɢᴏᴏᴅʙʏᴇ ɪs ᴏғғ ({label})</b>\n"
+                f"<code>{esc(preview)}</code>{note}\n\nᴜsᴇ /quicksettings ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.",
             )
             return
-        await safe_reply(update, f"👋 <b>ᴀᴄᴛɪᴠᴇ ɢᴏᴏᴅʙʏᴇ ({label})</b>\n<code>{esc(template)}</code>")
+        await safe_reply(
+            update,
+            f"👋 <b>ᴀᴄᴛɪᴠᴇ ɢᴏᴏᴅʙʏᴇ ({label})</b>\n"
+            f"<code>{esc(preview)}</code>{note}",
+        )
         return
     if command == "rules":
         await safe_reply(update, f"📜 <b>ɢʀᴏᴜᴘ ʀᴜʟᴇs</b>\n{esc(row['rules'] or 'ɴᴏ ʀᴜʟᴇs sᴇᴛ')}")
@@ -2689,22 +2810,38 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if command in {"setwelcome", "setgoodbye", "setrules"}:
         field = {"setwelcome": "welcome", "setgoodbye": "goodbye", "setrules": "rules"}[command]
-        if not value:
-            await safe_reply(update, f"ᴜsᴇ /{command} ᴛᴇxᴛ")
-            return
-        STORE.db.execute(f"UPDATE chats SET {field}=? WHERE chat_id=?", (value, chat.id))
+        media_key = {"setwelcome": "welcome_media", "setgoodbye": "goodbye_media"}.get(command)
+        media: dict[str, str] | None = None
+        replied = update.effective_message.reply_to_message
+        if media_key and replied:
+            template, media = template_from_message(replied)
+            if not template and not media:
+                await safe_reply(update, f"ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴛᴇxᴛ ᴏʀ ᴍᴇᴅɪᴀ ᴍᴇssᴀɢᴇ ᴡɪᴛʜ /{command}.")
+                return
+        else:
+            if not value:
+                await safe_reply(update, f"ᴜsᴇ /{command} ᴛᴇxᴛ ᴏʀ ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴍᴇssᴀɢᴇ.")
+                return
+            template = value
+        STORE.db.execute(
+            f"UPDATE chats SET {field}=? WHERE chat_id=?", (template, chat.id)
+        )
         STORE.db.commit()
+        if media_key:
+            settings[media_key] = media
         if command == "setwelcome":
             settings["welcome_enabled"] = True
         elif command == "setgoodbye":
             settings["goodbye_enabled"] = True
         modcfg.save_settings(STORE, chat.id, settings)
-        await safe_reply(update, f"✅ {command} sᴀᴠᴇᴅ.")
+        kind = f" ({media['type']})" if media else ""
+        await safe_reply(update, f"✅ {command} sᴀᴠᴇᴅ{kind}.")
         return
     if command == "resetwelcome":
         STORE.db.execute("UPDATE chats SET welcome=NULL WHERE chat_id=?", (chat.id,))
         STORE.db.commit()
         settings["welcome_enabled"] = True
+        settings["welcome_media"] = None
         modcfg.save_settings(STORE, chat.id, settings)
         await safe_reply(update, "✅ ᴅᴇғᴀᴜʟᴛ ᴡᴇʟᴄᴏᴍᴇ ʀᴇsᴛᴏʀᴇᴅ.")
         return
@@ -2712,6 +2849,7 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         STORE.db.execute("UPDATE chats SET goodbye=NULL WHERE chat_id=?", (chat.id,))
         STORE.db.commit()
         settings["goodbye_enabled"] = True
+        settings["goodbye_media"] = None
         modcfg.save_settings(STORE, chat.id, settings)
         await safe_reply(update, "✅ ᴅᴇғᴀᴜʟᴛ ɢᴏᴏᴅʙʏᴇ ʀᴇsᴛᴏʀᴇᴅ.")
         return
@@ -4330,11 +4468,8 @@ async def ai_reply(
         return
 
     if not zara_ai.has_ai_key():
-        if chat.type == ChatType.PRIVATE:
-            await safe_reply(
-                update,
-                "AI key abhi set nahi hai, thoda owner ko tag karo 💗",
-            )
+        fallback = zara_ai.fallback_reply(text, zara_ai.detect_language(text))
+        await safe_reply(update, styled(fallback))
         return
 
     replied_message = message.reply_to_message
@@ -4359,18 +4494,29 @@ async def ai_reply(
     except TelegramError:
         pass
 
-    result = await zara_ai.generate_reply(
-        text=text,
-        chat_id=chat.id,
-        user_id=user.id,
-        user_name=user_name,
-        user_gender=zara_ai.detect_user_gender(text),
-        replied_sender=replied_sender,
-        replied_text=replied_text,
-        length="short",
-        max_tokens=120,
-    )
+    try:
+        result = await zara_ai.generate_reply(
+            text=text,
+            chat_id=chat.id,
+            user_id=user.id,
+            user_name=user_name,
+            user_gender=zara_ai.detect_user_gender(text),
+            replied_sender=replied_sender,
+            replied_text=replied_text,
+            length="short",
+            max_tokens=120,
+        )
+    except Exception:
+        log.exception("AI reply generation failed")
+        result = None
+
     if not result:
+        fallback = zara_ai.fallback_reply(text, zara_ai.detect_language(text))
+        log.info("AI reply used local fallback in %s", chat.id)
+        try:
+            await message.reply_text(styled(fallback))
+        except TelegramError as exc:
+            log.info("AI fallback reply failed: %s", type(exc).__name__)
         return
 
     zara_ai.MEMORY.store(chat.id, user.id, "assistant", result.text)

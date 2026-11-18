@@ -1,3 +1,10 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from telegram.constants import ChatType
+
+import bot as zara_bot
 from zara import ai
 
 
@@ -99,3 +106,86 @@ def test_groq_endpoint_gets_fallback_model(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     models = [item[3] for item in ai._provider_candidates()]
     assert models == ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"]
+
+
+@pytest.mark.asyncio
+async def test_ai_reply_sends_local_fallback_when_generation_is_empty(monkeypatch):
+    monkeypatch.setattr(ai, "has_ai_key", lambda: True)
+    monkeypatch.setattr(ai, "generate_reply", AsyncMock(return_value=None))
+    message = SimpleNamespace(text="hello", reply_to_message=None, reply_text=AsyncMock())
+    user = SimpleNamespace(id=2, first_name="Riya", username="riya", is_bot=False)
+    chat = SimpleNamespace(id=-1001, type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=user,
+        effective_chat=chat,
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+    await zara_bot.ai_reply(update, context, text="hello")
+
+    message.reply_text.assert_awaited_once()
+    assert "ʜᴇʏʏ" in message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_ai_reply_sends_fallback_when_generation_raises(monkeypatch):
+    monkeypatch.setattr(ai, "has_ai_key", lambda: True)
+    monkeypatch.setattr(
+        ai, "generate_reply", AsyncMock(side_effect=RuntimeError("provider down"))
+    )
+    message = SimpleNamespace(text="hello", reply_to_message=None, reply_text=AsyncMock())
+    user = SimpleNamespace(id=2, first_name="Riya", username="riya", is_bot=False)
+    chat = SimpleNamespace(id=-1001, type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=user,
+        effective_chat=chat,
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+    await zara_bot.ai_reply(update, context, text="hello")
+
+    message.reply_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ai_reply_without_key_still_answers(monkeypatch):
+    monkeypatch.setattr(ai, "has_ai_key", lambda: False)
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    message = SimpleNamespace(text="hello", reply_to_message=None, reply_text=AsyncMock())
+    user = SimpleNamespace(id=2, first_name="Riya", username="riya", is_bot=False)
+    chat = SimpleNamespace(id=-1001, type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=user,
+        effective_chat=chat,
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+    await zara_bot.ai_reply(update, context, text="hello")
+
+    reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_reply_timeout_uses_fallback(monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "gsk-test")
+    monkeypatch.setenv("XAI_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    class ImmediateTimeout:
+        async def __aenter__(self):
+            raise TimeoutError
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ai.asyncio, "timeout", lambda seconds: ImmediateTimeout())
+
+    result = await ai.generate_reply(text="hello", chat_id=1, user_id=2)
+
+    assert result is not None
+    assert result.provider == "local"

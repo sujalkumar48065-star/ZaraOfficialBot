@@ -677,7 +677,7 @@ async def _call_provider(
             }
         )
     transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
-    timeout = httpx.Timeout(35.0, connect=10.0)
+    timeout = httpx.Timeout(12.0, connect=5.0)
     async with httpx.AsyncClient(
         timeout=timeout, transport=transport, follow_redirects=True
     ) as client:
@@ -776,26 +776,30 @@ async def generate_reply(
     ]
     last_error: Exception | None = None
     candidates = _provider_candidates()
-    for attempt in range(2):
-        for provider, endpoint, key, model in candidates:
-            try:
-                reply = await _call_provider(
-                    provider,
-                    endpoint,
-                    key,
-                    model,
-                    messages,
-                    max_tokens=max_tokens if attempt == 0 else max(max_tokens, 180),
-                    temperature=temperature if attempt == 0 else min(temperature, 0.7),
-                )
-                if reply:
-                    return AIReply(text=reply, provider=provider, model=model)
-                last_error = AIError(f"{provider} returned an empty reply")
-            except (httpx.HTTPError, AIError, ValueError, TypeError) as exc:
-                last_error = exc
-                log.warning("%s chat provider failed: %s", provider, type(exc).__name__)
-        if attempt == 0:
-            await asyncio.sleep(1.5)
+    try:
+        async with asyncio.timeout(22):
+            for attempt in range(2):
+                for provider, endpoint, key, model in candidates:
+                    try:
+                        reply = await _call_provider(
+                            provider,
+                            endpoint,
+                            key,
+                            model,
+                            messages,
+                            max_tokens=max_tokens if attempt == 0 else max(max_tokens, 180),
+                            temperature=temperature if attempt == 0 else min(temperature, 0.7),
+                        )
+                        if reply:
+                            return AIReply(text=reply, provider=provider, model=model)
+                        last_error = AIError(f"{provider} returned an empty reply")
+                    except (httpx.HTTPError, AIError, ValueError, TypeError) as exc:
+                        last_error = exc
+                        log.warning("%s chat provider failed: %s", provider, type(exc).__name__)
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+    except TimeoutError:
+        log.warning("AI reply timed out; using local fallback")
     if last_error:
         log.warning("All chat providers failed: %s", type(last_error).__name__)
     fallback = fallback_reply(text, language)

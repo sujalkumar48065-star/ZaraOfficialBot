@@ -70,6 +70,8 @@ CONFIG_KEYS = frozenset(DEFAULT_PENALTIES)
 DEFAULT_SETTINGS: dict[str, Any] = {
     "welcome_enabled": True,
     "goodbye_enabled": True,
+    "welcome_media": None,
+    "goodbye_media": None,
     "antilink": False,
     "antibio": False,
     "antispam": False,
