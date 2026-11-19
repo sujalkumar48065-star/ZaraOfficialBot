@@ -142,12 +142,12 @@ CATEGORIES: dict[str, dict[str, Any]] = {
     "welcome": {
         "title": "Welcome & Goodbye",
         "rows": [
-            ("welcome", "show the active welcome message"),
+            ("welcome", "show welcome; use /welcome on|off"),
             ("setwelcome", "set a custom welcome message"),
             ("resetwelcome", "restore the default welcome"),
-            ("goodbye", "show the goodbye message"),
+            ("goodbye", "show goodbye; use /goodbye on|off"),
             ("setgoodbye", "set a custom goodbye message"),
-            ("resetgoodbye", "turn goodbye off"),
+            ("resetgoodbye", "restore the default goodbye"),
         ],
         "note": (
             "Variables: {mention} {name} {first_name} {last_name} "

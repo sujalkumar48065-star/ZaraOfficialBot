@@ -86,6 +86,9 @@ def make_settings_update(reply, *, text: str = "/setwelcome"):
 @pytest.mark.asyncio
 async def test_setwelcome_reply_to_text_saves_exact_content(store, monkeypatch):
     monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        zara_bot, "bot_admin_check", AsyncMock(return_value=(True, ""))
+    )
     reply = AsyncMock()
     monkeypatch.setattr(zara_bot, "safe_reply", reply)
     target = SimpleNamespace(
@@ -114,6 +117,9 @@ async def test_setwelcome_reply_to_text_saves_exact_content(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_setwelcome_reply_to_photo_saves_media_and_caption(store, monkeypatch):
     monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        zara_bot, "bot_admin_check", AsyncMock(return_value=(True, ""))
+    )
     monkeypatch.setattr(zara_bot, "safe_reply", AsyncMock())
     target = SimpleNamespace(
         text=None,
@@ -148,6 +154,9 @@ async def test_setwelcome_reply_to_photo_saves_media_and_caption(store, monkeypa
 @pytest.mark.asyncio
 async def test_custom_goodbye_is_exact_without_default_extras(store, monkeypatch):
     monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        zara_bot, "bot_admin_check", AsyncMock(return_value=(True, ""))
+    )
     monkeypatch.setattr(zara_bot, "safe_reply", AsyncMock())
     target = SimpleNamespace(
         text="goodbye",
@@ -249,3 +258,138 @@ async def test_media_welcome_falls_back_to_text_when_photo_fails(store, monkeypa
 
     context.bot.send_message.assert_awaited_once()
     assert context.bot.send_message.await_args.args[1] == "custom welcome"
+
+
+@pytest.mark.asyncio
+async def test_welcome_off_keeps_custom_and_on_restores_it(store, monkeypatch):
+    monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        zara_bot, "bot_admin_check", AsyncMock(return_value=(True, ""))
+    )
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    target = SimpleNamespace(
+        text="my custom welcome",
+        text_html="my custom welcome",
+        caption=None,
+        caption_html=None,
+        photo=None,
+        video=None,
+        animation=None,
+        document=None,
+        sticker=None,
+    )
+    await zara_bot.group_settings(
+        make_settings_update(target, text="/setwelcome"), make_context()
+    )
+    await zara_bot.group_settings(
+        make_settings_update(None, text="/welcome off"), make_context()
+    )
+
+    row = store.chat(-1001, "Test Group")
+    settings = modcfg.load_settings(row)
+    assert settings["welcome_enabled"] is False
+    assert row["welcome"] == "my custom welcome"
+
+    await zara_bot.group_settings(
+        make_settings_update(None, text="/welcome on"), make_context()
+    )
+    row = store.chat(-1001, "Test Group")
+    settings = modcfg.load_settings(row)
+    assert settings["welcome_enabled"] is True
+
+    context = make_context()
+    await zara_bot.process_join(context, make_chat(), make_user())
+    assert context.bot.send_message.await_args.args[1] == "my custom welcome"
+
+
+@pytest.mark.asyncio
+async def test_group_settings_blocks_non_admin(store, monkeypatch):
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=False))
+    target = SimpleNamespace(
+        text="custom",
+        text_html="custom",
+        caption=None,
+        caption_html=None,
+        photo=None,
+        video=None,
+        animation=None,
+        document=None,
+        sticker=None,
+    )
+
+    await zara_bot.group_settings(
+        make_settings_update(target, text="/setwelcome"), make_context()
+    )
+
+    assert "ᴀᴅᴍɪɴs ᴏɴʟʏ" in reply.await_args.args[1]
+    assert store.chat(-1001, "Test Group")["welcome"] is None
+
+
+@pytest.mark.asyncio
+async def test_callback_admin_guard_blocks_non_admin(monkeypatch):
+    chat = make_chat()
+    query = SimpleNamespace(
+        message=SimpleNamespace(chat=chat),
+        answer=AsyncMock(),
+        id="callback-1",
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=chat,
+        effective_user=make_user(),
+    )
+    monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=False))
+
+    allowed = await zara_bot.callback_admin_guard(update, make_context())
+
+    assert allowed is False
+    assert "ᴀᴅᴍɪɴs ᴏɴʟʏ" in query.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_callback_admin_guard_requires_bot_admin(monkeypatch):
+    chat = make_chat()
+    query = SimpleNamespace(
+        message=SimpleNamespace(chat=chat),
+        answer=AsyncMock(),
+        id="callback-2",
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=chat,
+        effective_user=make_user(),
+    )
+    monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        zara_bot,
+        "bot_admin_check",
+        AsyncMock(return_value=(False, "❌ ᴍᴀᴋᴇ ᴢᴀʀᴀ ᴀ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴ ғɪʀsᴛ.")),
+    )
+
+    allowed = await zara_bot.callback_admin_guard(update, make_context())
+
+    assert allowed is False
+    assert "ᴍᴀᴋᴇ ᴢᴀʀᴀ" in query.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_welcome_toggle_blocked_when_bot_not_admin(store, monkeypatch):
+    reply = AsyncMock()
+    monkeypatch.setattr(zara_bot, "safe_reply", reply)
+    monkeypatch.setattr(zara_bot, "is_group_admin", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        zara_bot,
+        "bot_admin_check",
+        AsyncMock(return_value=(False, "❌ ᴍᴀᴋᴇ ᴢᴀʀᴀ ᴀ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴ ғɪʀsᴛ.")),
+    )
+
+    await zara_bot.group_settings(
+        make_settings_update(None, text="/welcome off"), make_context()
+    )
+
+    assert "ᴍᴀᴋᴇ ᴢᴀʀᴀ" in reply.await_args.args[1]
+    row = store.chat(-1001, "Test Group")
+    assert modcfg.load_settings(row)["welcome_enabled"] is True

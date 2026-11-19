@@ -1760,6 +1760,34 @@ async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return False
 
 
+async def callback_admin_guard(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Block moderation callbacks for non-admins and missing bot rights."""
+    query = update.callback_query
+    message = query.message if query else None
+    chat = message.chat if message else None
+    if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        await answer_callback(
+            query,
+            "❌ ᴛʜɪs sᴇᴛᴛɪɴɢ ᴡᴏʀᴋs ɪɴ ɢʀᴏᴜᴘs ᴏɴʟʏ.",
+            show_alert=True,
+        )
+        return False
+    if not await is_group_admin(update, context):
+        await answer_callback(
+            query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True
+        )
+        return False
+    allowed, error = await bot_admin_check(context, chat)
+    if not allowed:
+        await answer_callback(
+            query, re.sub(r"<[^>]+>", "", error), show_alert=True
+        )
+        return False
+    return True
+
+
 async def bot_admin_check(
     context: ContextTypes.DEFAULT_TYPE,
     chat: Any,
@@ -2236,11 +2264,25 @@ async def post_init(application: Application) -> None:
         ("currency", "convert currency"),
         ("poll", "create a poll"),
         ("setemoji", "set your custom emoji"),
-        ("setwelcome", "set the group welcome"),
-        ("setgoodbye", "set the group goodbye"),
-        ("setrules", "set the group rules"),
-        ("close", "close economy games in this chat"),
-        ("open", "open economy games in this chat"),
+    ]
+    admin_only_commands = [
+        ("welcome", "admin: show welcome; /welcome on|off"),
+        ("setwelcome", "admin: set the group welcome"),
+        ("goodbye", "admin: show goodbye; /goodbye on|off"),
+        ("setgoodbye", "admin: set the group goodbye"),
+        ("setrules", "admin: set the group rules"),
+        ("filters", "admin: list group filters"),
+        ("filter", "admin: add a group filter"),
+        ("blacklist", "admin: blacklist a word"),
+        ("unblacklist", "admin: remove a blacklisted word"),
+        ("stop", "admin: remove one filter"),
+        ("stopall", "admin: remove all filters"),
+        ("close", "admin: close economy games"),
+        ("open", "admin: open economy games"),
+    ]
+    public_commands = [
+        item for item in public_commands
+        if item[0] not in {name for name, _ in admin_only_commands}
     ]
     try:
         await bot.set_my_commands([BotCommand(a, b) for a, b in public_commands])
@@ -2252,7 +2294,7 @@ async def post_init(application: Application) -> None:
     }
     admin_commands = [
         item for item in public_commands if item[0] not in admin_menu_hidden
-    ] + [
+    ] + admin_only_commands + [
         ("ban", "ban a user"),
         ("unban", "unban a user"),
         ("kick", "kick a user"),
@@ -2279,7 +2321,7 @@ async def post_init(application: Application) -> None:
             )
         except TelegramError as exc:
             log.warning("Could not set admin command menu: %s", exc)
-    owner_commands = public_commands + [
+    owner_commands = public_commands + admin_only_commands + [
         ("m", "owner control center"),
         ("maddmoney", "owner: add money"),
         ("maddgems", "owner: add gems"),
@@ -2716,21 +2758,44 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_reply(update, hint)
         return
     chat = update.effective_chat
+    if command not in {"rules", "report"}:
+        if not await is_group_admin(update, context):
+            await safe_reply(update, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ. ᴀsᴋ ᴀ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴ ᴛᴏ ᴜsᴇ ᴛʜɪs.")
+            return
+        allowed, error = await bot_admin_check(context, chat)
+        if not allowed:
+            await safe_reply(update, error)
+            return
     row = STORE.chat(chat.id, chat.title or "")
     settings = modcfg.load_settings(row)
     value = (update.effective_message.text or "").partition(" ")[2].strip()
     arg = value.lower().split()[0] if value else ""
 
     if command == "welcome":
-        if not settings.get("welcome_enabled"):
-            await safe_reply(update, "👋 ᴡᴇʟᴄᴏᴍᴇ ɪs ᴏғғ. ᴜsᴇ /quicksettings ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.")
-            return
         media = settings.get("welcome_media")
         media = media if isinstance(media, dict) else None
         template = row["welcome"] or ("" if media else modcfg.DEFAULT_WELCOME)
         label = "ᴄᴜsᴛᴏᴍ" if row["welcome"] or media else "ᴅᴇғᴀᴜʟᴛ"
         preview = template or f"[{media.get('type', 'media')} media]"
         note = f"\n📎 {media['type']} attached" if media else ""
+        if arg in {"on", "off", "enable", "disable"}:
+            settings["welcome_enabled"] = arg in {"on", "enable"}
+            modcfg.save_settings(STORE, chat.id, settings)
+            state = "ᴇɴᴀʙʟᴇᴅ" if settings["welcome_enabled"] else "ᴅɪsᴀʙʟᴇᴅ"
+            await safe_reply(
+                update,
+                f"👋 ᴡᴇʟᴄᴏᴍᴇ {state}. {label} ᴍᴇssᴀɢᴇ sᴀᴠᴇᴅ.\n"
+                f"<code>{esc(preview)}</code>{note}",
+            )
+            return
+        if not settings.get("welcome_enabled"):
+            await safe_reply(
+                update,
+                f"👋 <b>ᴡᴇʟᴄᴏᴍᴇ ɪs ᴏғғ ({label})</b>\n"
+                f"<code>{esc(preview)}</code>{note}\n\n"
+                "ᴜsᴇ /welcome on ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.",
+            )
+            return
         await safe_reply(
             update,
             f"👋 <b>ᴀᴄᴛɪᴠᴇ ᴡᴇʟᴄᴏᴍᴇ ({label})</b>\n"
@@ -2744,11 +2809,22 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         label = "ᴄᴜsᴛᴏᴍ" if row["goodbye"] or media else "ᴅᴇғᴀᴜʟᴛ"
         preview = template or f"[{media.get('type', 'media')} media]"
         note = f"\n📎 {media['type']} attached" if media else ""
+        if arg in {"on", "off", "enable", "disable"}:
+            settings["goodbye_enabled"] = arg in {"on", "enable"}
+            modcfg.save_settings(STORE, chat.id, settings)
+            state = "ᴇɴᴀʙʟᴇᴅ" if settings["goodbye_enabled"] else "ᴅɪsᴀʙʟᴇᴅ"
+            await safe_reply(
+                update,
+                f"👋 ɢᴏᴏᴅʙʏᴇ {state}. {label} ᴍᴇssᴀɢᴇ sᴀᴠᴇᴅ.\n"
+                f"<code>{esc(preview)}</code>{note}",
+            )
+            return
         if not settings.get("goodbye_enabled"):
             await safe_reply(
                 update,
                 f"👋 <b>ɢᴏᴏᴅʙʏᴇ ɪs ᴏғғ ({label})</b>\n"
-                f"<code>{esc(preview)}</code>{note}\n\nᴜsᴇ /quicksettings ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.",
+                f"<code>{esc(preview)}</code>{note}\n\n"
+                "ᴜsᴇ /goodbye on ᴛᴏ ᴛᴜʀɴ ɪᴛ ᴏɴ.",
             )
             return
         await safe_reply(
@@ -5734,6 +5810,8 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
     elif query.data == "mod:home":
+        if not await callback_admin_guard(update, context):
+            return
         await edit_callback_message(
             query,
             MODERATION_PAGE,
@@ -5742,6 +5820,8 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=modular_moderation_keyboard(),
         )
     elif query.data in MODERATION_CATEGORY_PAGES:
+        if not await callback_admin_guard(update, context):
+            return
         await edit_callback_message(
             query,
             MODERATION_CATEGORY_PAGES[query.data],
@@ -5749,17 +5829,7 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=modular_moderation_category_keyboard(),
         )
     elif query.data == "mod:quick":
-        if not query.message or query.message.chat.type == ChatType.PRIVATE:
-            await edit_callback_message(
-                query,
-                QUICK_SETTINGS_INFO,
-                image_path=MENU_IMAGES.get("mod:quick"),
-                parse_mode=ParseMode.HTML,
-                reply_markup=modular_moderation_category_keyboard(),
-            )
-            return
-        if not await is_group_admin(update, context):
-            await answer_callback(query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True)
+        if not await callback_admin_guard(update, context):
             return
         row = STORE.chat(query.message.chat.id, query.message.chat.title or "")
         settings = modcfg.load_settings(row)
@@ -5770,11 +5840,7 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=modular_quick_settings_keyboard(settings, 0),
         )
     elif query.data.startswith("qs:toggle:"):
-        if not query.message or query.message.chat.type == ChatType.PRIVATE:
-            await answer_callback(query, "ɢʀᴏᴜᴘs ᴏɴʟʏ.", show_alert=True)
-            return
-        if not await is_group_admin(update, context):
-            await answer_callback(query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True)
+        if not await callback_admin_guard(update, context):
             return
         key = query.data.split(":", 2)[2]
         page = modcfg.quick_settings_page_for_key(key)
@@ -5794,11 +5860,7 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         await answer_callback(query, f"{key}: {'on' if enabled else 'off'}")
     elif query.data.startswith("qs:config:"):
-        if not query.message or query.message.chat.type == ChatType.PRIVATE:
-            await answer_callback(query, "ɢʀᴏᴜᴘs ᴏɴʟʏ.", show_alert=True)
-            return
-        if not await is_group_admin(update, context):
-            await answer_callback(query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True)
+        if not await callback_admin_guard(update, context):
             return
         key = query.data.split(":", 2)[2]
         if key not in modcfg.CONFIG_KEYS:
@@ -5817,11 +5879,7 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         await answer_callback(query, f"{key}: {modcfg.PENALTY_LABELS[penalty]}")
     elif query.data.startswith("qs:page:"):
-        if not query.message or query.message.chat.type == ChatType.PRIVATE:
-            await answer_callback(query, "ɢʀᴏᴜᴘs ᴏɴʟʏ.", show_alert=True)
-            return
-        if not await is_group_admin(update, context):
-            await answer_callback(query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True)
+        if not await callback_admin_guard(update, context):
             return
         try:
             page = int(query.data.split(":", 2)[2])
@@ -5838,8 +5896,7 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif query.data == "qs:noop":
         await answer_callback(query, "ᴜsᴇ ᴛʜᴇ sᴛᴀᴛᴜs ᴏʀ ᴘᴇɴᴀʟᴛʏ ʙᴜᴛᴛᴏɴ.")
     elif query.data.startswith("qs:refresh"):
-        if not query.message or query.message.chat.type == ChatType.PRIVATE:
-            await answer_callback(query, "ɢʀᴏᴜᴘs ᴏɴʟʏ.", show_alert=True)
+        if not await callback_admin_guard(update, context):
             return
         parts = query.data.split(":", 2)
         try:
@@ -5855,11 +5912,7 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=modular_quick_settings_keyboard(settings, page),
         )
     elif query.data.startswith("prot:toggle:"):
-        if not query.message or query.message.chat.type == ChatType.PRIVATE:
-            await answer_callback(query, "ɢʀᴏᴜᴘs ᴏɴʟʏ.", show_alert=True)
-            return
-        if not await is_group_admin(update, context):
-            await answer_callback(query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True)
+        if not await callback_admin_guard(update, context):
             return
         key = query.data.split(":", 2)[2]
         if key not in modcfg.PROTECTION_LABELS:
@@ -5881,11 +5934,7 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         await answer_callback(query, f"{key}: {'on' if enabled else 'off'}")
     elif query.data.startswith("prot:config:"):
-        if not query.message or query.message.chat.type == ChatType.PRIVATE:
-            await answer_callback(query, "ɢʀᴏᴜᴘs ᴏɴʟʏ.", show_alert=True)
-            return
-        if not await is_group_admin(update, context):
-            await answer_callback(query, "❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.", show_alert=True)
+        if not await callback_admin_guard(update, context):
             return
         key = query.data.split(":", 2)[2]
         if key not in modcfg.CONFIG_KEYS:
@@ -5939,6 +5988,8 @@ async def _callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 show_alert=True,
             )
     elif query.data == "cat:moderation":
+        if not await callback_admin_guard(update, context):
+            return
         await edit_callback_message(
             query,
             MODERATION_PAGE,
