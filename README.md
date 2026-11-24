@@ -48,7 +48,7 @@ Set these as secure environment secrets (never commit them):
 - `XAI_MODEL` — Grok model, defaults to `grok-4`
 - `OPENROUTER_API_KEY` — fallback AI provider
 - `OPENAI_API_KEY` — optional fallback when OpenRouter is unavailable
-- `GIPHY_API_KEY` — optional secure GIPHY key for PG-13 anime GIFs
+- `GIPHY_API_KEY` — optional secure GIPHY fallback key for PG-13 anime GIFs
 
 Normal chat is command-free: Zara replies to every DM text message, and in
 groups only when replied to, mentioned, or addressed by name. Stickers get a
@@ -117,21 +117,23 @@ document. `/image` uses the free Pollinations image endpoint.
 
 ## GIF actions
 
-GIFs are bundled locally and are the primary action path, so `/kiss`, `/hug`, `/slap`, `/punch`, `/murder`, `/bite`, `/love`, `/crush`, `/pat`, `/cuddle`, `/dance`, `/highfive`, and `/bonk` work without an external GIF API. Reply to a user's message or pass `@username`/Telegram ID:
+GIF actions use the public Nekos.best v2 anime GIF API first, so `/kiss`, `/hug`, `/slap`, `/punch`, `/murder`, `/bite`, `/love`, `/crush`, `/pat`, `/cuddle`, `/dance`, `/highfive`, and `/bonk` get action-specific anime animations. Bundled GIFs remain the final fallback, so the commands still work without any external API. Reply to a user's message or pass `@username`/Telegram ID:
 
 ```text
 /kiss @username
 /hug 123456789
 ```
 
-Remote generic GIF fallback is disabled. Zara uses anime-only GIPHY searches
-when the secure key is available and bundled anime animations otherwise.
+Remote generic GIF fallback is disabled. Zara uses Nekos.best first, then
+anime-only GIPHY searches when the secure key is available, then bundled anime
+animations.
 
 ## GIPHY and stickers
 
-When `GIPHY_API_KEY` is configured as a secure Replit Secret, Zara searches
-only for PG-13 anime GIFs for each action. If GIPHY is unavailable, the
-bundled anime animations are sent automatically.
+Zara searches Nekos.best for action-specific anime GIFs without an API key. If
+Nekos.best is unavailable and `GIPHY_API_KEY` is configured as a secure Replit
+Secret, Zara falls back to PG-13 anime GIPHY searches. If both are unavailable,
+the bundled anime animations are sent automatically.
 
 The configured Telegram sticker packs are loaded at startup from Telegram and are not copied into the ZIP. Telegram file IDs are reused safely at runtime:
 
@@ -175,7 +177,7 @@ Reply to a message with /punch
 If an explicit username is not known to Zara, the bot asks for a reply or
 Telegram ID instead of accidentally sending the action to the sender.
 
-Inline mode provides anime-only action-specific GIPHY choices. In any Telegram chat type
+Inline mode provides anime-only action-specific Nekos.best GIF choices, with GIPHY as fallback. In any Telegram chat type
 `@Meee_Zarabot hug`, `@Meee_Zarabot kiss`, `@Meee_Zarabot love`,
 `@Meee_Zarabot slap`, or another action name, then choose a result. The
 empty inline menu also contains quick buttons for common actions.
@@ -194,9 +196,9 @@ without a command; a short cooldown prevents sticker spam.
 the verifier, and tap **Verify membership**. The bot checks membership again
 server-side before confirming the user.
 
-Each GIF action searches an anime-specific GIPHY pool of up to 50 results and
-avoids repeating the last 20 results for that action. If GIPHY is unavailable,
-the bundled anime GIF fallback remains available.
+Each GIF action fetches a small Nekos.best pool, caches it briefly, and avoids
+repeating recent URLs for that action. If Nekos.best is unavailable, the GIPHY
+and bundled anime GIF fallbacks remain available.
 
 Owner and admin accounts are visible in `/leaderboard`, `/topkill`, and
 `/leaders`; staff resources display as `∞`, while owner/admin protection rules

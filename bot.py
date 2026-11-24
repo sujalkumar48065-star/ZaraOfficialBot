@@ -24,6 +24,7 @@ from zara import ai as zara_ai
 from zara import cloud as zara_cloud
 from zara import config as app_config
 from zara import moderation as modcfg
+from zara import nekos as zara_nekos
 from zara import tools as zara_tools
 from zara.command_registry import build_admin_commands, build_commands
 from zara.db import (
@@ -4591,8 +4592,8 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + "</blockquote>"
     )
 
-    # Prefer the GIF uploaded to the Zara database channel, then GIPHY,
-    # then the bundled animations.
+    # Prefer the GIF uploaded to the Zara database channel, then Nekos.best,
+    # then GIPHY, then the bundled animations.
     channel_gif = STORE.db.get_meta(f"action_gif:{command}")
     if channel_gif:
         try:
@@ -4608,6 +4609,22 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         except TelegramError as exc:
             log.warning("Channel GIF failed for %s: %s", command, exc)
+
+    nekos_gif = await zara_nekos.get_animation(command)
+    if nekos_gif:
+        try:
+            await update.effective_message.reply_animation(
+                nekos_gif.url, caption=caption, parse_mode=ParseMode.HTML
+            )
+            STORE.db.execute(
+                "INSERT INTO action_counters(action,count) VALUES(?,1) "
+                "ON CONFLICT(action) DO UPDATE SET count=count+1",
+                (command,),
+            )
+            STORE.db.commit()
+            return
+        except TelegramError as exc:
+            log.warning("Nekos GIF failed for %s: %s", command, exc)
 
     giphy = await giphy_animation(command)
     if giphy:
@@ -4625,8 +4642,8 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except TelegramError:
             pass
 
-    # Bundled animations are the primary path. This keeps the main feature
-    # reliable when GIPHY is slow, rate-limited, or unavailable.
+    # Bundled animations are the final fallback when remote APIs are
+    # slow, rate-limited, or unavailable.
     local_candidates = GIF_ASSETS.get(command, GIF_ASSETS["love"])
     local_path = random.choice(local_candidates)
     if local_path.exists():
@@ -4646,7 +4663,7 @@ async def action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("Bundled GIF failed for %s: %s", command, exc)
 
     # Do not use generic remote endpoints here: Zara promises anime-only GIFs.
-    # If GIPHY and the bundled anime animation both fail, send the caption only.
+    # If every GIF source fails, send the caption only.
     await safe_reply(update, caption)
 
 
@@ -5687,35 +5704,70 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     action_name = requested if requested in ACTION_NAMES else ""
     action_results: list[Any] = []
     if action_name:
-        records = await giphy_search(action_name, limit=8)
-        for index, record in enumerate(records):
-            action_results.append(
-                InlineQueryResultGif(
-                    id=f"zara-{action_name}-{record['id']}-{index}",
-                    gif_url=record["gif_url"],
-                    thumbnail_url=record["thumbnail_url"],
-                    gif_width=record["width"],
-                    gif_height=record["height"],
-                    title=f"{action_name.title()} GIF",
-                    caption=(
-                        f"💗 <b>{action_name.title()} reaction</b>\n"
-                        f"Use <code>/{action_name} @username</code> in a group."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [[
-                            InlineKeyboardButton(
-                                f"🔁 More {action_name}",
-                                switch_inline_query_current_chat=action_name,
-                            ),
-                            InlineKeyboardButton(
-                                "📚 Help",
-                                url=f"https://t.me/{username}?start=help",
-                            ),
-                        ]]
-                    ),
+        nekos_records = await zara_nekos.search(action_name, amount=8)
+        if nekos_records:
+            for index, record in enumerate(nekos_records):
+                digest = hashlib.sha1(record.url.encode()).hexdigest()[:12]
+                title = action_name.title()
+                if record.anime_name:
+                    title = f"{title} · {record.anime_name}"
+                action_results.append(
+                    InlineQueryResultGif(
+                        id=f"zara-neko-{action_name}-{digest}-{index}",
+                        gif_url=record.url,
+                        thumbnail_url=record.url,
+                        gif_width=record.width,
+                        gif_height=record.height,
+                        title=title,
+                        caption=(
+                            f"💗 <b>{action_name.title()} reaction</b>\n"
+                            f"Use <code>/{action_name} @username</code> in a group."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(
+                            [[
+                                InlineKeyboardButton(
+                                    f"🔁 More {action_name}",
+                                    switch_inline_query_current_chat=action_name,
+                                ),
+                                InlineKeyboardButton(
+                                    "📚 Help",
+                                    url=f"https://t.me/{username}?start=help",
+                                ),
+                            ]]
+                        ),
+                    )
                 )
-            )
+        else:
+            records = await giphy_search(action_name, limit=8)
+            for index, record in enumerate(records):
+                action_results.append(
+                    InlineQueryResultGif(
+                        id=f"zara-{action_name}-{record['id']}-{index}",
+                        gif_url=record["gif_url"],
+                        thumbnail_url=record["thumbnail_url"],
+                        gif_width=record["width"],
+                        gif_height=record["height"],
+                        title=f"{action_name.title()} GIF",
+                        caption=(
+                            f"💗 <b>{action_name.title()} reaction</b>\n"
+                            f"Use <code>/{action_name} @username</code> in a group."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(
+                            [[
+                                InlineKeyboardButton(
+                                    f"🔁 More {action_name}",
+                                    switch_inline_query_current_chat=action_name,
+                                ),
+                                InlineKeyboardButton(
+                                    "📚 Help",
+                                    url=f"https://t.me/{username}?start=help",
+                                ),
+                            ]]
+                        ),
+                    )
+                )
     if action_results:
         results = action_results
     elif action_name:
